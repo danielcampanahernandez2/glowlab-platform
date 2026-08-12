@@ -84,5 +84,11 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Evolution API Settings
+    EVOLUTION_API_URL: str = "https://evolution-api-production-2fb7.up.railway.app"
+    EVOLUTION_API_KEY: str = "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e"
+    EVOLUTION_INSTANCE_NAME: str = "glowlab-bot"
+
+
 
 settings = Settings()
