@@ -51,7 +51,7 @@ async def get_openai_reply(sender_name: str, message_text: str) -> Optional[str]
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code == 200:
                 data = response.json()
@@ -74,7 +74,7 @@ def get_fallback_reply(sender_name: str, message_text: str) -> str:
     nombre = sender_name or "Cliente"
 
     # Saludos comunes
-    if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey", "ola"]):
+    if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey", "ola", "start", "menu"]):
         return (
             f"✨ ¡Hola {nombre}! Bienvenido/a a *Glowlab*.\n\n"
             "¿En qué podemos consentirte hoy?\n"
@@ -120,20 +120,23 @@ def get_fallback_reply(sender_name: str, message_text: str) -> str:
             "En un momento se comunicará contigo por este mismo chat. ¡Gracias por tu paciencia!"
         )
 
-    # Respuesta por defecto
+    # Respuesta por defecto inteligente
     return (
         f"Gracias por comunicarte con *Glowlab*, {nombre}. 🌸\n\n"
-        "Hemos recibido tu mensaje y una asesora se comunicará contigo en breve para darte todos los detalles.\n\n"
-        "Si deseas ver nuestros servicios, escribe *Menu* o *Cita* para agendar."
+        "Hemos recibido tu mensaje y una asesora especializada te responderá en breve.\n\n"
+        "Si deseas ver nuestros servicios y agendar de inmediato, escribe *Hola* o *Menu*."
     )
 
 
-async def send_whatsapp_message(number: str, text: str, instance_name: Optional[str] = None) -> bool:
-    """Envía un mensaje de texto a través de Evolution API."""
+async def send_whatsapp_message(number: str, text: str, instance_name: Optional[str] = None) -> Dict[str, Any]:
+    """Envía un mensaje de texto a través de Evolution API y devuelve el resultado detallado."""
     target_instance = instance_name or "glowlab-bot"
-    url = f"{settings.EVOLUTION_API_URL.rstrip('/')}/message/sendText/{target_instance}"
+    base_evo_url = getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app").rstrip("/")
+    api_key = getattr(settings, "EVOLUTION_API_KEY", "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e")
+
+    url = f"{base_evo_url}/message/sendText/{target_instance}"
     headers = {
-        "apikey": settings.EVOLUTION_API_KEY,
+        "apikey": api_key,
         "Content-Type": "application/json",
     }
     payload = {
@@ -144,17 +147,15 @@ async def send_whatsapp_message(number: str, text: str, instance_name: Optional[
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(url, headers=headers, json=payload)
-            if response.status_code in (200, 201):
-                logger.info(f"✔ Mensaje enviado exitosamente a {number} via [{target_instance}]")
-                return True
-            else:
-                logger.error(
-                    f"✖ Error enviando mensaje a {number} via [{target_instance}]. Status: {response.status_code}, Body: {response.text}"
-                )
-                return False
+            logger.info(f"Evolution API respuesta: {response.status_code} -> {response.text}")
+            return {
+                "success": response.status_code in (200, 201),
+                "status_code": response.status_code,
+                "response": response.text,
+            }
     except Exception as e:
-        logger.error(f"✖ Excepción conectando con Evolution API para {number}: {str(e)}")
-        return False
+        logger.error(f"Excepción conectando con Evolution API: {str(e)}")
+        return {"success": False, "error": str(e)}
 
 
 def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
@@ -169,9 +170,7 @@ def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
 async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
     """Procesa el webhook de Evolution API y responde con IA o menú."""
     try:
-        # Detectar el nombre exacto de la instancia que disparó el webhook
-        instance_name = payload.get("instance") or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
-        
+        instance_name = payload.get("instance") or "glowlab-bot"
         raw_data = payload.get("data")
         items = extract_message_items(raw_data)
 
@@ -237,7 +236,15 @@ async def verify_webhook():
         "service": "Glowlab WhatsApp AI Assistant",
         "ai_engine": getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
         "instance": getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot"),
+        "evolution_url": getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app"),
     }
+
+
+@router.get("/test-send")
+async def test_send(number: str = "51946559792", text: str = "Prueba de envio desde Glowlab API"):
+    """Endpoint directo para probar la conexión con Evolution API."""
+    result = await send_whatsapp_message(number=number, text=text, instance_name="glowlab-bot")
+    return result
 
 
 @router.post("/webhook")
@@ -245,15 +252,16 @@ async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
 ):
-    """Endpoint receptor de eventos de Evolution API."""
+    """Endpoint receptor universal de eventos de Evolution API."""
     try:
         payload = await request.json()
     except Exception:
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content="Invalid JSON")
 
     event = str(payload.get("event", "")).lower()
+    logger.info(f"Webhook recibido: Evento=[{event}] Instancia=[{payload.get('instance')}]")
 
-    if "upsert" in event:
-        background_tasks.add_task(process_incoming_whatsapp_message, payload)
+    # Procesar cualquier mensaje con data
+    background_tasks.add_task(process_incoming_whatsapp_message, payload)
 
     return {"status": "received", "event": payload.get("event")}
