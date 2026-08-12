@@ -1,6 +1,6 @@
 """WhatsApp Webhook endpoint for Evolution API integration."""
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Union
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
 import httpx
 
@@ -27,15 +27,15 @@ async def send_whatsapp_message(number: str, text: str) -> bool:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code in (200, 201):
-                logger.info(f"Mensaje enviado con éxito a {number}")
+                logger.info(f"✔ Mensaje enviado exitosamente a {number}")
                 return True
             else:
                 logger.error(
-                    f"Error al enviar mensaje a {number}. Status: {response.status_code}, Body: {response.text}"
+                    f"✖ Error enviando mensaje a {number}. Status: {response.status_code}, Body: {response.text}"
                 )
                 return False
     except Exception as e:
-        logger.error(f"Excepción al conectar con Evolution API para {number}: {str(e)}")
+        logger.error(f"✖ Excepción conectando con Evolution API para {number}: {str(e)}")
         return False
 
 
@@ -45,7 +45,7 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
     nombre = sender_name or "Cliente"
 
     # Saludos comunes
-    if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey"]):
+    if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey", "ola"]):
         return (
             f"✨ ¡Hola {nombre}! Bienvenido/a a *Glowlab*.\n\n"
             "¿En qué podemos ayudarte hoy?\n"
@@ -57,7 +57,7 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
         )
 
     # Opciones de menú
-    elif text_clean in ["1", "servicios", "tratamientos"]:
+    elif text_clean in ["1", "servicios", "tratamientos", "servicio", "tratamiento"]:
         return (
             "💆‍♀️ *Nuestros Servicios en Glowlab:*\n\n"
             "• Limpieza Facial Profunda & Hidratación\n"
@@ -67,7 +67,7 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
             "Escribe *2* o *Agendar* para reservar tu turno."
         )
 
-    elif text_clean in ["2", "cita", "agendar", "reservar"]:
+    elif text_clean in ["2", "cita", "agendar", "reservar", "turno"]:
         return (
             "📅 *Agenda tu Cita en Glowlab:*\n\n"
             "Por favor indícanos:\n"
@@ -77,7 +77,7 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
             "Un asesor confirmará tu reserva en breves minutos. ✨"
         )
 
-    elif text_clean in ["3", "precios", "promociones", "costo"]:
+    elif text_clean in ["3", "precios", "promociones", "costo", "precio", "promocion"]:
         return (
             "🏷️ *Promociones del Mes en Glowlab:*\n\n"
             "✨ *Pack Glow Radiante:* Facial + Hidratación (20% OFF)\n"
@@ -85,7 +85,7 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
             "¿Deseas más información de algún tratamiento en específico?"
         )
 
-    elif text_clean in ["4", "asesor", "humano", "ayuda"]:
+    elif text_clean in ["4", "asesor", "humano", "ayuda", "contacto"]:
         return (
             "👤 Hemos notificado a uno de nuestros especialistas.\n"
             "En un momento se comunicará contigo por este mismo chat. ¡Gracias por tu paciencia!"
@@ -99,45 +99,69 @@ def generate_bot_reply(sender_name: str, message_text: str) -> str:
     )
 
 
+def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
+    """Normaliza el payload de data tanto si viene como lista o como dict."""
+    if isinstance(raw_data, list):
+        return [item for item in raw_data if isinstance(item, dict)]
+    elif isinstance(raw_data, dict):
+        return [raw_data]
+    return []
+
+
 async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
-    """Procesa el webhook recibido de Evolution API en segundo plano."""
+    """Procesa el webhook recibido de Evolution API de forma robusta."""
     try:
-        data = payload.get("data", {})
-        key = data.get("key", {})
+        raw_data = payload.get("data")
+        items = extract_message_items(raw_data)
 
-        # Ignorar mensajes enviados por el propio bot (fromMe: true) para evitar bucles infinitos
-        if key.get("fromMe", False):
-            return
+        if not items:
+            # Si el payload es plano
+            if "key" in payload and isinstance(payload["key"], dict):
+                items = [payload]
 
-        remote_jid = key.get("remoteJid", "")
-        # Ignorar mensajes de difusión o grupos si es necesario
-        if not remote_jid or remote_jid == "status@broadcast":
-            return
+        for item in items:
+            key = item.get("key", {})
+            if not isinstance(key, dict):
+                continue
 
-        # Extraer el número de teléfono limpio
-        sender_number = remote_jid.split("@")[0]
-        sender_name = data.get("pushName", "")
+            # Ignorar mensajes enviados por el propio bot para evitar bucles infinitos
+            if key.get("fromMe", False):
+                continue
 
-        # Extraer el contenido del mensaje
-        message_data = data.get("message", {})
-        message_text = ""
+            remote_jid = key.get("remoteJid", "")
+            if not remote_jid or remote_jid == "status@broadcast" or "@g.us" in remote_jid:
+                continue
 
-        if "conversation" in message_data and message_data["conversation"]:
-            message_text = message_data["conversation"]
-        elif "extendedTextMessage" in message_data and "text" in message_data["extendedTextMessage"]:
-            message_text = message_data["extendedTextMessage"]["text"]
+            # Extraer número limpio
+            sender_number = remote_jid.split("@")[0]
+            sender_name = item.get("pushName", "")
 
-        if not message_text.strip():
-            logger.info(f"Mensaje recibido sin texto procesable de {sender_number}")
-            return
+            # Extraer texto del mensaje
+            message_data = item.get("message", {})
+            if not isinstance(message_data, dict):
+                continue
 
-        logger.info(f"Mensaje recibido de [{sender_number}] ({sender_name}): {message_text}")
+            message_text = ""
+            if "conversation" in message_data and message_data["conversation"]:
+                message_text = str(message_data["conversation"])
+            elif "extendedTextMessage" in message_data and isinstance(message_data["extendedTextMessage"], dict):
+                message_text = str(message_data["extendedTextMessage"].get("text", ""))
+            elif "imageMessage" in message_data and isinstance(message_data["imageMessage"], dict):
+                message_text = str(message_data["imageMessage"].get("caption", ""))
+            elif "videoMessage" in message_data and isinstance(message_data["videoMessage"], dict):
+                message_text = str(message_data["videoMessage"].get("caption", ""))
 
-        # Generar respuesta automática
-        reply = generate_bot_reply(sender_name, message_text)
+            if not message_text.strip():
+                logger.info(f"Mensaje sin texto procesable de {sender_number}")
+                continue
 
-        # Enviar respuesta al usuario
-        await send_whatsapp_message(sender_number, reply)
+            logger.info(f"Mensaje entrante de [{sender_number}] ({sender_name}): {message_text}")
+
+            # Generar respuesta automática
+            reply = generate_bot_reply(sender_name, message_text)
+
+            # Enviar respuesta al usuario
+            await send_whatsapp_message(sender_number, reply)
 
     except Exception as e:
         logger.error(f"Error procesando mensaje entrante de WhatsApp: {str(e)}", exc_info=True)
@@ -164,11 +188,11 @@ async def receive_webhook(
     except Exception:
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content="Invalid JSON")
 
-    event = payload.get("event", "")
+    event = str(payload.get("event", "")).lower()
     logger.info(f"Evento recibido en Webhook: {event}")
 
-    # Procesar mensajes entrantes en segundo plano para responder HTTP 200 de inmediato a Evolution API
-    if event in ("messages.upsert", "MESSAGES_UPSERT"):
+    # Procesar eventos de tipo messages.upsert (soporta cualquier variación de mayúsculas/guiones)
+    if "upsert" in event:
         background_tasks.add_task(process_incoming_whatsapp_message, payload)
 
-    return {"status": "received", "event": event}
+    return {"status": "received", "event": payload.get("event")}
