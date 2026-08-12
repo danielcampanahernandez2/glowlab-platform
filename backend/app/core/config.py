@@ -1,5 +1,5 @@
 """Application configuration using Pydantic Settings."""
-from typing import List, Union
+from typing import Dict, List, Union
 from pydantic import AnyHttpUrl, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     # OpenAI Settings
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # Staff / Equipo de Glowlab
+    STAFF_MEMBERS: Dict[str, str] = {
+        "51992509246": "Lisbeth",
+        "51925528059": "Anali",
+    }
+
 
 
 

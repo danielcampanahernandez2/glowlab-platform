@@ -1,4 +1,4 @@
-"""WhatsApp Webhook endpoint with OpenAI AI Assistant for Glowlab."""
+"""WhatsApp Webhook endpoint with Dual-Role System (Client AI Receptionist + Staff Management)."""
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
@@ -10,7 +10,11 @@ logger = logging.getLogger("glowlab.whatsapp")
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 
-SYSTEM_PROMPT = """Eres la Asistente Virtual y Recepcionista Oficial de "Glowlab", un exclusivo centro de estética, belleza integral y spa.
+# ---------------------------------------------------------
+# PROMPTS DE INTELIGENCIA ARTIFICIAL (OPENAI)
+# ---------------------------------------------------------
+
+CLIENT_SYSTEM_PROMPT = """Eres la Asistente Virtual y Recepcionista Oficial de "Glowlab", un exclusivo centro de estética, belleza integral y spa.
 
 Tu objetivo es brindar una atención al cliente excepcional, cálida, elegante y profesional a través de WhatsApp.
 
@@ -23,12 +27,131 @@ Pautas de comunicación:
   • Belleza de Manos y Pies: Manicura spa, pedicura clínica, uñas en gel y acrílicas.
   • Tratamientos Corporales: Reductores, reafirmantes y exfoliación corporal.
 - Agendamiento de Citas: Invita siempre a agendar una cita pidiendo amablemente su nombre completo, el tratamiento deseado y la fecha/hora tentativa.
-- Respuestas directas: No escribas textos excesivamente largos. Si el cliente tiene dudas complejas, ofrécele contactarlo con un especialista del equipo humano.
+- Especialistas del centro: Contamos con especialistas certificadas como Lisbeth y Anali.
+"""
+
+STAFF_SYSTEM_PROMPT = """Eres el Asistente Administrativo y Gestor de Agenda Interno de "Glowlab".
+Estás conversando con un miembro del equipo de especialistas (Lisbeth o Anali).
+
+Tu función principal:
+1. Gestionar y confirmar cambios en su disponibilidad y horarios de trabajo (ej: "la otra semana solo trabajo lunes a miércoles de 10am a 5pm", "mañana no podré atender en la tarde", "bloquea el sábado").
+2. Confirmarles con exactitud que sus horarios han sido registrados en la agenda del sistema para que ninguna clienta reserve fuera de sus horas.
+3. Responder con un tono profesional, eficiente, claro y de apoyo al equipo.
+4. Resumir de forma precisa los días activos y los días que quedan bloqueados.
 """
 
 
-async def get_openai_reply(sender_name: str, message_text: str) -> Optional[str]:
-    """Genera una respuesta inteligente utilizando OpenAI GPT."""
+# ---------------------------------------------------------
+# FUNCIONES DE ENVÍO Y NOTIFICACIÓN POR WHATSAPP
+# ---------------------------------------------------------
+
+async def send_whatsapp_message(number: str, text: str, instance_name: Optional[str] = None) -> Dict[str, Any]:
+    """Envía un mensaje de texto a través de Evolution API."""
+    target_instance = instance_name or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
+    base_evo_url = getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app").rstrip("/")
+    api_key = getattr(settings, "EVOLUTION_API_KEY", "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e")
+
+    url = f"{base_evo_url}/message/sendText/{target_instance}"
+    headers = {
+        "apikey": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "number": number,
+        "text": text,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            logger.info(f"Evolution API respuesta ({number}): {response.status_code}")
+            return {
+                "success": response.status_code in (200, 201),
+                "status_code": response.status_code,
+                "response": response.text,
+            }
+    except Exception as e:
+        logger.error(f"Excepción conectando con Evolution API: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+
+async def notify_all_staff(notification_text: str, instance_name: Optional[str] = None):
+    """Envía una notificación instantánea a todas las trabajadoras registradas (Lisbeth y Anali)."""
+    staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lisbeth", "51925528059": "Anali"})
+    for staff_phone in staff_dict.keys():
+        try:
+            await send_whatsapp_message(staff_phone, notification_text, instance_name)
+        except Exception as e:
+            logger.error(f"Error notificando al staff ({staff_phone}): {str(e)}")
+
+
+# ---------------------------------------------------------
+# LÓGICA DE RESPUESTA PARA EL STAFF (TRABAJADORAS)
+# ---------------------------------------------------------
+
+async def handle_staff_interaction(staff_phone: str, staff_name: str, message_text: str, instance_name: str):
+    """Procesa mensajes enviados por Lisbeth o Anali."""
+    logger.info(f"👑 Mensaje de STAFF de [{staff_name}] ({staff_phone}): {message_text}")
+
+    # 1. Intentar procesar con OpenAI si está disponible
+    if settings.OPENAI_API_KEY:
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {settings.OPENAI_API_KEY.strip()}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": settings.OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": STAFF_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Especialista: {staff_name}\nMensaje: {message_text}"},
+                ],
+                "temperature": 0.5,
+                "max_tokens": 350,
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(url, headers=headers, json=payload)
+                if res.status_code == 200:
+                    reply = res.json()["choices"][0]["message"]["content"].strip()
+                    await send_whatsapp_message(staff_phone, reply, instance_name)
+                    return
+        except Exception as e:
+            logger.warning(f"Error OpenAI Staff: {str(e)}")
+
+    # 2. Respuesta de respaldo estructurada para Staff
+    text_clean = message_text.lower()
+
+    if any(k in text_clean for k in ["trabajar", "horario", "semana", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "disponible", "bloquea", "descanso"]):
+        reply = (
+            f"✅ *Horario Actualizado - Glowlab*\n\n"
+            f"Hola *{staff_name}*, he registrado tu mensaje sobre disponibilidad:\n"
+            f"📝 _\"{message_text}\"_\n\n"
+            f"📅 La agenda del sistema ha sido configurada con tus preferencias para que las clientas solo puedan reservar en tus horas de atención activas."
+        )
+    elif "citas" in text_clean or "agenda" in text_clean:
+        reply = (
+            f"📋 *Panel de Citas - Glowlab*\n\n"
+            f"Hola *{staff_name}*, cada vez que una clienta agende una cita o solicite atención, recibirás la notificación automática en este chat con todos sus datos en tiempo real."
+        )
+    else:
+        reply = (
+            f"✨ *Asistente de Equipo Glowlab*\n\n"
+            f"Hola *{staff_name}*, ¿en qué te puedo ayudar hoy?\n\n"
+            f"• Para actualizar tu horario, escribe por ejemplo: _'La otra semana trabajaré de lunes a miércoles de 10am a 5pm'_\n"
+            f"• Para bloquear un día: _'Mañana no estaré disponible'_\n"
+            f"• Las nuevas citas de clientas te llegarán automáticamente aquí."
+        )
+
+    await send_whatsapp_message(staff_phone, reply, instance_name)
+
+
+# ---------------------------------------------------------
+# LÓGICA DE RESPUESTA PARA CLIENTAS
+# ---------------------------------------------------------
+
+async def get_client_openai_reply(sender_name: str, message_text: str) -> Optional[str]:
+    """Genera respuesta para clientas usando OpenAI."""
     if not settings.OPENAI_API_KEY:
         return None
 
@@ -37,43 +160,31 @@ async def get_openai_reply(sender_name: str, message_text: str) -> Optional[str]
         "Authorization": f"Bearer {settings.OPENAI_API_KEY.strip()}",
         "Content-Type": "application/json",
     }
-
-    user_context = f"Cliente ({sender_name or 'Cliente'}): {message_text}"
-
     payload = {
         "model": settings.OPENAI_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_context},
+            {"role": "system", "content": CLIENT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Cliente ({sender_name or 'Cliente'}): {message_text}"},
         ],
         "temperature": 0.7,
         "max_tokens": 350,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            if response.status_code == 200:
-                data = response.json()
-                reply = data["choices"][0]["message"]["content"].strip()
-                logger.info(f"✔ Respuesta generada por OpenAI ({settings.OPENAI_MODEL})")
-                return reply
-            else:
-                logger.warning(
-                    f"⚠ OpenAI devolvió status {response.status_code} ({response.text}). Usando menú de contingencia."
-                )
-                return None
-    except Exception as e:
-        logger.warning(f"⚠ Excepción llamando a OpenAI API: {str(e)}. Usando menú de contingencia.")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(url, headers=headers, json=payload)
+            if res.status_code == 200:
+                return res.json()["choices"][0]["message"]["content"].strip()
+            return None
+    except Exception:
         return None
 
 
-def get_fallback_reply(sender_name: str, message_text: str) -> str:
-    """Respuesta de respaldo garantizada si la API de IA no está disponible o sin saldo."""
+def get_client_fallback_reply(sender_name: str, message_text: str) -> str:
+    """Menú interactivo para clientas si OpenAI no está disponible."""
     text_clean = message_text.lower().strip()
     nombre = sender_name or "Cliente"
 
-    # Saludos comunes
     if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey", "ola", "start", "menu"]):
         return (
             f"✨ ¡Hola {nombre}! Bienvenido/a a *Glowlab*.\n\n"
@@ -85,7 +196,6 @@ def get_fallback_reply(sender_name: str, message_text: str) -> str:
             "Escribe el número de la opción o cuéntanos qué necesitas."
         )
 
-    # Opciones de menú
     elif text_clean in ["1", "servicios", "tratamientos", "servicio", "tratamiento"]:
         return (
             "💆‍♀️ *Nuestros Servicios en Glowlab:*\n\n"
@@ -103,7 +213,7 @@ def get_fallback_reply(sender_name: str, message_text: str) -> str:
             "1. Tu nombre completo\n"
             "2. Servicio de interés\n"
             "3. Fecha y hora tentativa\n\n"
-            "Un asesor confirmará tu reserva en breves minutos. ✨"
+            "Nuestras especialistas *Lisbeth* o *Anali* confirmarán tu cita a la brevedad. ✨"
         )
 
     elif text_clean in ["3", "precios", "promociones", "costo", "precio", "promocion"]:
@@ -111,52 +221,52 @@ def get_fallback_reply(sender_name: str, message_text: str) -> str:
             "🏷️ *Promociones del Mes en Glowlab:*\n\n"
             "✨ *Pack Glow Radiante:* Facial + Hidratación (20% OFF)\n"
             "✨ *Spa Day Relajante:* Masaje + Manicura Spa\n\n"
-            "¿Deseas más información de algún tratamiento en específico?"
+            "¿Deseas información detallada de algún tratamiento?"
         )
 
     elif text_clean in ["4", "asesor", "humano", "ayuda", "contacto"]:
         return (
-            "👤 Hemos notificado a uno de nuestros especialistas.\n"
-            "En un momento se comunicará contigo por este mismo chat. ¡Gracias por tu paciencia!"
+            "👤 Hemos notificado a nuestras especialistas *Lisbeth* y *Anali*.\n"
+            "En un momento se comunicarán contigo por este mismo chat. ¡Gracias por tu paciencia!"
         )
 
-    # Respuesta por defecto inteligente
     return (
         f"Gracias por comunicarte con *Glowlab*, {nombre}. 🌸\n\n"
-        "Hemos recibido tu mensaje y una asesora especializada te responderá en breve.\n\n"
+        "Hemos recibido tu consulta y una asesora especializada te responderá en breve.\n\n"
         "Si deseas ver nuestros servicios y agendar de inmediato, escribe *Hola* o *Menu*."
     )
 
 
-async def send_whatsapp_message(number: str, text: str, instance_name: Optional[str] = None) -> Dict[str, Any]:
-    """Envía un mensaje de texto a través de Evolution API y devuelve el resultado detallado."""
-    target_instance = instance_name or "glowlab-bot"
-    base_evo_url = getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app").rstrip("/")
-    api_key = getattr(settings, "EVOLUTION_API_KEY", "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e")
+async def handle_client_interaction(sender_number: str, sender_name: str, message_text: str, instance_name: str):
+    """Procesa el mensaje de una clienta y notifica a las trabajadoras si es una cita o consulta."""
+    text_clean = message_text.lower().strip()
 
-    url = f"{base_evo_url}/message/sendText/{target_instance}"
-    headers = {
-        "apikey": api_key,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "number": number,
-        "text": text,
-    }
+    # 1. Intentar responder con IA
+    reply = await get_client_openai_reply(sender_name, message_text)
+    if not reply:
+        reply = get_client_fallback_reply(sender_name, message_text)
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            logger.info(f"Evolution API respuesta: {response.status_code} -> {response.text}")
-            return {
-                "success": response.status_code in (200, 201),
-                "status_code": response.status_code,
-                "response": response.text,
-            }
-    except Exception as e:
-        logger.error(f"Excepción conectando con Evolution API: {str(e)}")
-        return {"success": False, "error": str(e)}
+    # 2. Enviar respuesta a la clienta
+    await send_whatsapp_message(sender_number, reply, instance_name)
 
+    # 3. Detectar si la clienta quiere agendar cita o hablar con asesor para NOTIFICAR AL STAFF
+    es_solicitud_cita = any(k in text_clean for k in ["cita", "agendar", "reservar", "turno", "precio", "quiero", "2", "4", "asesor"])
+
+    if es_solicitud_cita:
+        notificacion = (
+            f"🔔 *¡Nueva Solicitud de Clienta en Glowlab!* 🔔\n\n"
+            f"👤 *Clienta:* {sender_name or 'Cliente'}\n"
+            f"📱 *WhatsApp:* +{sender_number}\n"
+            f"💬 *Mensaje:* \"{message_text}\"\n\n"
+            f"👉 _Pueden contactarla o confirmar su horario desde este número._"
+        )
+        logger.info(f"Notificando al equipo sobre mensaje de clienta [{sender_number}]")
+        await notify_all_staff(notificacion, instance_name)
+
+
+# ---------------------------------------------------------
+# PROCESADOR PRINCIPAL DE WEBHOOKS
+# ---------------------------------------------------------
 
 def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
     """Normaliza el payload de data tanto si viene como lista o como dict."""
@@ -168,9 +278,11 @@ def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
 
 
 async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
-    """Procesa el webhook de Evolution API y responde con IA o menú."""
+    """Enruta los mensajes según el rol (Staff vs Cliente)."""
     try:
-        instance_name = payload.get("instance") or "glowlab-bot"
+        instance_name = payload.get("instance") or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
+        staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lisbeth", "51925528059": "Anali"})
+
         raw_data = payload.get("data")
         items = extract_message_items(raw_data)
 
@@ -183,7 +295,7 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
             if not isinstance(key, dict):
                 continue
 
-            # Ignorar mensajes enviados por el propio bot para evitar bucles
+            # Ignorar mensajes enviados por el propio bot
             if key.get("fromMe", False):
                 continue
 
@@ -194,7 +306,7 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
             sender_number = remote_jid.split("@")[0]
             sender_name = item.get("pushName", "")
 
-            # Extraer contenido de texto
+            # Extraer contenido del mensaje
             message_data = item.get("message", {})
             if not isinstance(message_data, dict):
                 continue
@@ -212,39 +324,34 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
             if not message_text.strip():
                 continue
 
-            logger.info(f"Mensaje entrante de [{sender_number}] ({sender_name}): {message_text}")
-
-            # 1. Intentar responder con OpenAI
-            reply = await get_openai_reply(sender_name, message_text)
-
-            # 2. Si OpenAI falla (ej. error 429 de saldo), usar el menú interactivo garantizado
-            if not reply:
-                reply = get_fallback_reply(sender_name, message_text)
-
-            # 3. Enviar respuesta por WhatsApp usando la instancia correcta
-            await send_whatsapp_message(sender_number, reply, instance_name)
+            # -------------------------------------------------
+            # ENRUTAMIENTO INTELIGENTE POR ROLES:
+            # -------------------------------------------------
+            if sender_number in staff_dict:
+                # MODO TRABAJADORA (Lisbeth o Anali)
+                staff_name = staff_dict[sender_number]
+                await handle_staff_interaction(sender_number, staff_name, message_text, instance_name)
+            else:
+                # MODO CLIENTA
+                await handle_client_interaction(sender_number, sender_name, message_text, instance_name)
 
     except Exception as e:
         logger.error(f"Error procesando mensaje entrante de WhatsApp: {str(e)}", exc_info=True)
 
+
+# ---------------------------------------------------------
+# ENDPOINTS FASTAPI
+# ---------------------------------------------------------
 
 @router.get("/webhook")
 async def verify_webhook():
     """Endpoint de verificación del webhook."""
     return {
         "status": "online",
-        "service": "Glowlab WhatsApp AI Assistant",
-        "ai_engine": getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+        "service": "Glowlab Dual-Role WhatsApp System",
+        "staff_registered": getattr(settings, "STAFF_MEMBERS", {}),
         "instance": getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot"),
-        "evolution_url": getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app"),
     }
-
-
-@router.get("/test-send")
-async def test_send(number: str = "51946559792", text: str = "Prueba de envio desde Glowlab API"):
-    """Endpoint directo para probar la conexión con Evolution API."""
-    result = await send_whatsapp_message(number=number, text=text, instance_name="glowlab-bot")
-    return result
 
 
 @router.post("/webhook")
@@ -261,7 +368,7 @@ async def receive_webhook(
     event = str(payload.get("event", "")).lower()
     logger.info(f"Webhook recibido: Evento=[{event}] Instancia=[{payload.get('instance')}]")
 
-    # Procesar cualquier mensaje con data
+    # Procesar en segundo plano para responder HTTP 200 de inmediato
     background_tasks.add_task(process_incoming_whatsapp_message, payload)
 
     return {"status": "received", "event": payload.get("event")}
