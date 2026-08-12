@@ -95,9 +95,10 @@ class Settings(BaseSettings):
 
     # Staff / Equipo de Glowlab
     STAFF_MEMBERS: Dict[str, str] = {
-        "51992509246": "Lisbeth",
+        "51992509246": "Lizbeth",
         "51925528059": "Anali",
     }
+
 
 
 

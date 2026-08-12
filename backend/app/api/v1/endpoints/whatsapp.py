@@ -27,11 +27,11 @@ Pautas de comunicación:
   • Belleza de Manos y Pies: Manicura spa, pedicura clínica, uñas en gel y acrílicas.
   • Tratamientos Corporales: Reductores, reafirmantes y exfoliación corporal.
 - Agendamiento de Citas: Invita siempre a agendar una cita pidiendo amablemente su nombre completo, el tratamiento deseado y la fecha/hora tentativa.
-- Especialistas del centro: Contamos con especialistas certificadas como Lisbeth y Anali.
+- Especialistas del centro: Contamos con especialistas certificadas como Lizbeth y Anali.
 """
 
 STAFF_SYSTEM_PROMPT = """Eres el Asistente Administrativo y Gestor de Agenda Interno de "Glowlab".
-Estás conversando con un miembro del equipo de especialistas (Lisbeth o Anali).
+Estás conversando con un miembro del equipo de especialistas (Lizbeth o Anali).
 
 Tu función principal:
 1. Gestionar y confirmar cambios en su disponibilidad y horarios de trabajo (ej: "la otra semana solo trabajo lunes a miércoles de 10am a 5pm", "mañana no podré atender en la tarde", "bloquea el sábado").
@@ -76,8 +76,8 @@ async def send_whatsapp_message(number: str, text: str, instance_name: Optional[
 
 
 async def notify_all_staff(notification_text: str, instance_name: Optional[str] = None):
-    """Envía una notificación instantánea a todas las trabajadoras registradas (Lisbeth y Anali)."""
-    staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lisbeth", "51925528059": "Anali"})
+    """Envía una notificación instantánea a todas las trabajadoras registradas (Lizbeth y Anali)."""
+    staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"})
     for staff_phone in staff_dict.keys():
         try:
             await send_whatsapp_message(staff_phone, notification_text, instance_name)
@@ -90,7 +90,7 @@ async def notify_all_staff(notification_text: str, instance_name: Optional[str] 
 # ---------------------------------------------------------
 
 async def handle_staff_interaction(staff_phone: str, staff_name: str, message_text: str, instance_name: str):
-    """Procesa mensajes enviados por Lisbeth o Anali."""
+    """Procesa mensajes enviados por Lizbeth o Anali."""
     logger.info(f"👑 Mensaje de STAFF de [{staff_name}] ({staff_phone}): {message_text}")
 
     # 1. Intentar procesar con OpenAI si está disponible
@@ -213,7 +213,7 @@ def get_client_fallback_reply(sender_name: str, message_text: str) -> str:
             "1. Tu nombre completo\n"
             "2. Servicio de interés\n"
             "3. Fecha y hora tentativa\n\n"
-            "Nuestras especialistas *Lisbeth* o *Anali* confirmarán tu cita a la brevedad. ✨"
+            "Nuestras especialistas *Lizbeth* o *Anali* confirmarán tu cita a la brevedad. ✨"
         )
 
     elif text_clean in ["3", "precios", "promociones", "costo", "precio", "promocion"]:
@@ -226,7 +226,7 @@ def get_client_fallback_reply(sender_name: str, message_text: str) -> str:
 
     elif text_clean in ["4", "asesor", "humano", "ayuda", "contacto"]:
         return (
-            "👤 Hemos notificado a nuestras especialistas *Lisbeth* y *Anali*.\n"
+            "👤 Hemos notificado a nuestras especialistas *Lizbeth* y *Anali*.\n"
             "En un momento se comunicarán contigo por este mismo chat. ¡Gracias por tu paciencia!"
         )
 
@@ -281,7 +281,7 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
     """Enruta los mensajes según el rol (Staff vs Cliente)."""
     try:
         instance_name = payload.get("instance") or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
-        staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lisbeth", "51925528059": "Anali"})
+        staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"})
 
         raw_data = payload.get("data")
         items = extract_message_items(raw_data)
@@ -328,7 +328,7 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
             # ENRUTAMIENTO INTELIGENTE POR ROLES:
             # -------------------------------------------------
             if sender_number in staff_dict:
-                # MODO TRABAJADORA (Lisbeth o Anali)
+                # MODO TRABAJADORA (Lizbeth o Anali)
                 staff_name = staff_dict[sender_number]
                 await handle_staff_interaction(sender_number, staff_name, message_text, instance_name)
             else:
