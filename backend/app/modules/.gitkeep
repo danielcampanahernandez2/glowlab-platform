@@ -1,0 +1,17 @@
+# Modular Monolith Bounded Contexts
+# Modules will be added in subsequent phases:
+# - auth
+# - tenants
+# - users
+# - branches
+# - workers
+# - services
+# - clients
+# - appointments
+# - schedules
+# - whatsapp
+# - ai
+# - notifications
+# - pos
+# - inventory
+# - analytics

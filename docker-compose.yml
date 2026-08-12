@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: glowlab_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: glowlab_user
+      POSTGRES_PASSWORD: glowlab_secure_password
+      POSTGRES_DB: glowlab_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glowlab_user -d glowlab_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: glowlab_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: glowlab_backend
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+    ports:
+      - "9000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://glowlab_user:glowlab_secure_password@postgres:5432/glowlab_db
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+      - DEBUG=True
+      - EVOLUTION_API_URL=https://evolution.glowlab-n8n.online
+      - EVOLUTION_API_KEY=Glowlab_Global_Key_2026
+      - EVOLUTION_INSTANCE_NAME=glowlab_salon
+      - AI_PROVIDER=openai
+      - OPENAI_API_KEY=tu_clave_aqui_o_vacia
+      - AI_MODEL=gpt-4o-mini
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
