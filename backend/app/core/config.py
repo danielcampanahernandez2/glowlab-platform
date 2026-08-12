@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     EVOLUTION_API_KEY: str = "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e"
     EVOLUTION_INSTANCE_NAME: str = "glowlab-bot"
 
+    # OpenAI Settings
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
+
+
 
 
 settings = Settings()
