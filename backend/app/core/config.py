@@ -99,6 +99,11 @@ class Settings(BaseSettings):
         "51925528059": "Anali",
     }
 
+    # Configuración de Adelanto y Pagos
+    PAYMENT_INFO: str = "Yape o Plin al número que te indicará la asesora"
+    ADVANCE_AMOUNT: int = 20
+
+
 
 
 

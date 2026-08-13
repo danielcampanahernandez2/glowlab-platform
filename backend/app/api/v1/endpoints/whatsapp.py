@@ -1,301 +1,486 @@
-"""WhatsApp Webhook endpoint with Dual-Role System (Client AI Receptionist + Staff Management)."""
+"""
+WhatsApp Webhook — Glowlab Conversational Agent.
+
+Sistema dual de atención:
+  • Clientas → máquina de estados conversacional con flujo de reservas
+  • Staff (Lizbeth / Anali) → asistente de agenda interna
+"""
 import logging
 from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
-import httpx
 
 from app.core.config import settings
+from app.core.database import async_session_factory
+from app.modules.salon import services as svc
 
 logger = logging.getLogger("glowlab.whatsapp")
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 
-# ---------------------------------------------------------
-# PROMPTS DE INTELIGENCIA ARTIFICIAL (OPENAI)
-# ---------------------------------------------------------
 
-CLIENT_SYSTEM_PROMPT = """Eres la Asistente Virtual y Recepcionista Oficial de "Glowlab", un exclusivo centro de estética, belleza integral y spa.
+# ============================================================
+# PROMPT DE SISTEMA PARA STAFF
+# ============================================================
 
-Tu objetivo es brindar una atención al cliente excepcional, cálida, elegante y profesional a través de WhatsApp.
+STAFF_SYSTEM_PROMPT = """Eres el asistente de agenda interno de "Glowlab".
+Estás hablando con una especialista del equipo.
 
-Pautas de comunicación:
-- Tono: Amable, empático, sofisticado y claro.
-- Formato: Respuestas breves y fáciles de leer en WhatsApp (usa saltos de línea, negritas *así* en palabras clave y emojis sutiles como ✨, 💆‍♀️, 🌸, 📅).
-- Servicios principales:
-  • Cuidado Facial: Limpieza facial profunda, hidratación intensiva, peeling, tratamientos anti-edad y rejuvenecimiento.
-  • Spa & Masajes: Masajes relajantes, descontracturantes, piedras calientes y drenaje linfático.
-  • Belleza de Manos y Pies: Manicura spa, pedicura clínica, uñas en gel y acrílicas.
-  • Tratamientos Corporales: Reductores, reafirmantes y exfoliación corporal.
-- Agendamiento de Citas: Invita siempre a agendar una cita pidiendo amablemente su nombre completo, el tratamiento deseado y la fecha/hora tentativa.
-- Especialistas del centro: Contamos con especialistas certificadas como Lizbeth y Anali.
-"""
+Tu función:
+1. Registrar cambios en su disponibilidad y horarios.
+2. Confirmar con exactitud qué días y horas quedan activos o bloqueados.
+3. Responder con tono profesional, claro y de apoyo.
 
-STAFF_SYSTEM_PROMPT = """Eres el Asistente Administrativo y Gestor de Agenda Interno de "Glowlab".
-Estás conversando con un miembro del equipo de especialistas (Lizbeth o Anali).
-
-Tu función principal:
-1. Gestionar y confirmar cambios en su disponibilidad y horarios de trabajo (ej: "la otra semana solo trabajo lunes a miércoles de 10am a 5pm", "mañana no podré atender en la tarde", "bloquea el sábado").
-2. Confirmarles con exactitud que sus horarios han sido registrados en la agenda del sistema para que ninguna clienta reserve fuera de sus horas.
-3. Responder con un tono profesional, eficiente, claro y de apoyo al equipo.
-4. Resumir de forma precisa los días activos y los días que quedan bloqueados.
-"""
+Responde de forma breve y precisa."""
 
 
-# ---------------------------------------------------------
-# FUNCIONES DE ENVÍO Y NOTIFICACIÓN POR WHATSAPP
-# ---------------------------------------------------------
+# ============================================================
+# MANEJADOR: STAFF (LIZBETH / ANALI)
+# ============================================================
 
-async def send_whatsapp_message(number: str, text: str, instance_name: Optional[str] = None) -> Dict[str, Any]:
-    """Envía un mensaje de texto a través de Evolution API."""
-    target_instance = instance_name or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
-    base_evo_url = getattr(settings, "EVOLUTION_API_URL", "https://evolution-api-production-2fb7.up.railway.app").rstrip("/")
-    api_key = getattr(settings, "EVOLUTION_API_KEY", "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e")
+async def handle_staff_message(
+    staff_phone: str, staff_name: str, message_text: str
+) -> None:
+    """Procesa mensajes enviados por las asesoras del equipo."""
+    logger.info(f"[STAFF] {staff_name} ({staff_phone}): {message_text}")
 
-    url = f"{base_evo_url}/message/sendText/{target_instance}"
-    headers = {
-        "apikey": api_key,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "number": number,
-        "text": text,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            logger.info(f"Evolution API respuesta ({number}): {response.status_code}")
-            return {
-                "success": response.status_code in (200, 201),
-                "status_code": response.status_code,
-                "response": response.text,
-            }
-    except Exception as e:
-        logger.error(f"Excepción conectando con Evolution API: {str(e)}")
-        return {"success": False, "error": str(e)}
-
-
-async def notify_all_staff(notification_text: str, instance_name: Optional[str] = None):
-    """Envía una notificación instantánea a todas las trabajadoras registradas (Lizbeth y Anali)."""
-    staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"})
-    for staff_phone in staff_dict.keys():
-        try:
-            await send_whatsapp_message(staff_phone, notification_text, instance_name)
-        except Exception as e:
-            logger.error(f"Error notificando al staff ({staff_phone}): {str(e)}")
-
-
-# ---------------------------------------------------------
-# LÓGICA DE RESPUESTA PARA EL STAFF (TRABAJADORAS)
-# ---------------------------------------------------------
-
-async def handle_staff_interaction(staff_phone: str, staff_name: str, message_text: str, instance_name: str):
-    """Procesa mensajes enviados por Lizbeth o Anali."""
-    logger.info(f"👑 Mensaje de STAFF de [{staff_name}] ({staff_phone}): {message_text}")
-
-    # 1. Intentar procesar con OpenAI si está disponible
+    # Intentar respuesta con OpenAI
     if settings.OPENAI_API_KEY:
         try:
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {settings.OPENAI_API_KEY.strip()}",
-                "Content-Type": "application/json",
-            }
+            import httpx
             payload = {
                 "model": settings.OPENAI_MODEL,
                 "messages": [
                     {"role": "system", "content": STAFF_SYSTEM_PROMPT},
                     {"role": "user", "content": f"Especialista: {staff_name}\nMensaje: {message_text}"},
                 ],
-                "temperature": 0.5,
-                "max_tokens": 350,
+                "temperature": 0.4,
+                "max_tokens": 300,
             }
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.post(url, headers=headers, json=payload)
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
                 if res.status_code == 200:
                     reply = res.json()["choices"][0]["message"]["content"].strip()
-                    await send_whatsapp_message(staff_phone, reply, instance_name)
+                    await svc.send_message(staff_phone, reply)
                     return
         except Exception as e:
-            logger.warning(f"Error OpenAI Staff: {str(e)}")
+            logger.warning(f"Error OpenAI staff: {e}")
 
-    # 2. Respuesta de respaldo estructurada para Staff
-    text_clean = message_text.lower()
-
-    if any(k in text_clean for k in ["trabajar", "horario", "semana", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "disponible", "bloquea", "descanso"]):
+    # Respuesta de respaldo por palabras clave
+    text_low = message_text.lower()
+    if any(k in text_low for k in ("horario", "semana", "lunes", "martes", "miercoles",
+                                    "jueves", "viernes", "sabado", "disponible",
+                                    "bloquea", "descanso", "libre", "trabajar")):
         reply = (
-            f"✅ *Horario Actualizado - Glowlab*\n\n"
-            f"Hola *{staff_name}*, he registrado tu mensaje sobre disponibilidad:\n"
-            f"📝 _\"{message_text}\"_\n\n"
-            f"📅 La agenda del sistema ha sido configurada con tus preferencias para que las clientas solo puedan reservar en tus horas de atención activas."
+            f"✅ *Horario actualizado — Glowlab*\n\n"
+            f"Hola *{staff_name}*, registré tu disponibilidad:\n"
+            f"📝 _{message_text}_\n\n"
+            f"La agenda quedará configurada para que solo se reserve en tus horarios activos."
         )
-    elif "citas" in text_clean or "agenda" in text_clean:
+    elif any(k in text_low for k in ("cita", "agenda", "reserva")):
         reply = (
-            f"📋 *Panel de Citas - Glowlab*\n\n"
-            f"Hola *{staff_name}*, cada vez que una clienta agende una cita o solicite atención, recibirás la notificación automática en este chat con todos sus datos en tiempo real."
+            f"📋 *Agenda — Glowlab*\n\n"
+            f"Hola *{staff_name}*, cada cita nueva que llegue te la notificaré "
+            f"aquí con todos los datos en tiempo real."
         )
     else:
         reply = (
-            f"✨ *Asistente de Equipo Glowlab*\n\n"
-            f"Hola *{staff_name}*, ¿en qué te puedo ayudar hoy?\n\n"
-            f"• Para actualizar tu horario, escribe por ejemplo: _'La otra semana trabajaré de lunes a miércoles de 10am a 5pm'_\n"
-            f"• Para bloquear un día: _'Mañana no estaré disponible'_\n"
-            f"• Las nuevas citas de clientas te llegarán automáticamente aquí."
+            f"Hola *{staff_name}* 👋\n\n"
+            f"• Para actualizar tu horario escribe, por ejemplo:\n"
+            f"  _'Esta semana trabajo de lunes a viernes de 10am a 6pm'_\n"
+            f"• Para bloquear un día: _'Mañana no atiendo'_\n"
+            f"• Las nuevas citas te llegarán automáticamente aquí."
         )
 
-    await send_whatsapp_message(staff_phone, reply, instance_name)
+    await svc.send_message(staff_phone, reply)
 
 
-# ---------------------------------------------------------
-# LÓGICA DE RESPUESTA PARA CLIENTAS
-# ---------------------------------------------------------
+# ============================================================
+# MANEJADOR: CLIENTAS — MÁQUINA DE ESTADOS
+# ============================================================
 
-async def get_client_openai_reply(sender_name: str, message_text: str) -> Optional[str]:
-    """Genera respuesta para clientas usando OpenAI."""
-    if not settings.OPENAI_API_KEY:
-        return None
+async def handle_client_message(
+    sender_number: str,
+    sender_name: str,
+    message_text: str,
+    message_data: Dict[str, Any],
+    raw_item: Dict[str, Any],
+) -> None:
+    """
+    Máquina de estados conversacional para clientas.
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.OPENAI_API_KEY.strip()}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": CLIENT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Cliente ({sender_name or 'Cliente'}): {message_text}"},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 350,
-    }
+    Pasos del flujo de reserva:
+        inicial → recolectando → mostrando_horarios
+        → esperando_confirmacion → esperando_voucher
+        → cita_confirmada | derivada
+    """
+    async with async_session_factory() as db:
+        state = await svc.load_state(sender_number)
+        paso = state.get("paso", "inicial")
 
+        # Guardar nombre si es la primera vez que lo tenemos
+        if sender_name and not state.get("nombre"):
+            state["nombre"] = sender_name
+
+        # ── ESTADO: DERIVADA ──────────────────────────────────
+        if paso == "derivada":
+            await svc.send_message(
+                sender_number,
+                "Tu consulta está siendo atendida por una asesora. Te avisamos pronto. 🌸"
+            )
+            return
+
+        # ── EXTRACCIÓN DE INTENCIÓN ───────────────────────────
+        intent_data = await svc.extract_intent(state, message_text)
+        intent = intent_data.get("intent", "otro")
+
+        # Actualizar servicio si se mencionó por primera vez
+        if intent_data.get("servicio") and not state.get("servicio"):
+            state["servicio"] = intent_data["servicio"]
+            state["asesora"] = svc.detect_advisor(intent_data["servicio"])
+
+        # Actualizar fecha si se mencionó por primera vez
+        if intent_data.get("fecha") and not state.get("fecha"):
+            from datetime import date
+            parsed = svc.parse_fecha(intent_data["fecha"])
+            if parsed and parsed >= date.today():
+                state["fecha"] = parsed.strftime("%Y-%m-%d")
+
+        # ── ESTADO: ESPERANDO VOUCHER ─────────────────────────
+        if paso == "esperando_voucher":
+            await _handle_voucher_step(
+                sender_number, state, message_text,
+                message_data, raw_item, intent_data, db
+            )
+            return
+
+        # ── ESTADO: ESPERANDO CONFIRMACIÓN DEL RESUMEN ───────
+        if paso == "esperando_confirmacion":
+            await _handle_confirmation_step(sender_number, state, intent, db)
+            return
+
+        # ── ESTADO: MOSTRANDO HORARIOS ────────────────────────
+        if paso == "mostrando_horarios":
+            await _handle_slot_selection(sender_number, state, intent_data)
+            return
+
+        # ── ESTADO: CITA CONFIRMADA (nueva conversación) ─────
+        if paso == "cita_confirmada":
+            state = {"paso": "inicial", "nombre": state.get("nombre") or sender_name}
+
+        # ── EXCEPCIÓN EXPLÍCITA ───────────────────────────────
+        if intent_data.get("requiere_excepcion") or intent == "excepcion":
+            state["paso"] = "derivada"
+            await svc.save_state(sender_number, state)
+            await svc.notify_all_staff(
+                f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
+                f"necesita atención especial:\n\"{message_text}\""
+            )
+            await svc.send_message(
+                sender_number,
+                "Entiendo. Voy a consultar con una asesora y te avisamos enseguida. 🌸"
+            )
+            return
+
+        # ── SALUDO SIMPLE (sin datos de reserva aún) ─────────
+        if intent == "saludo" and paso == "inicial" and not state.get("servicio"):
+            nombre = (state.get("nombre") or "").split()[0] if state.get("nombre") else ""
+            greeting = f"¡Hola{' ' + nombre if nombre else ''}! 🌸 ¿En qué te ayudamos hoy?"
+            await svc.save_state(sender_number, state)
+            await svc.send_message(sender_number, greeting)
+            return
+
+        # ── CONSULTA DE PRECIO ────────────────────────────────
+        if intent == "consultar":
+            await svc.send_message(
+                sender_number,
+                "Indícanos qué servicio te interesa y te damos el detalle de precios. 💅"
+            )
+            return
+
+        # ── CANCELACIÓN ───────────────────────────────────────
+        if intent == "cancelar":
+            await svc.clear_state(sender_number)
+            await svc.send_message(
+                sender_number,
+                "Entendido, tu solicitud ha sido cancelada. Si necesitas algo más, escríbenos. 🌸"
+            )
+            return
+
+        # ── RECOLECCIÓN / FLUJO DE RESERVA ───────────────────
+        await _handle_booking_flow(sender_number, state, intent, db)
+
+
+# ─────────────────────────────────────────────────────────────
+# FUNCIONES AUXILIARES DE PASOS
+# ─────────────────────────────────────────────────────────────
+
+async def _handle_booking_flow(
+    sender_number: str,
+    state: Dict[str, Any],
+    intent: str,
+    db: Any,
+) -> None:
+    """Recoge datos de la reserva y avanza el flujo cuando están completos."""
+    state["paso"] = "recolectando"
+
+    if not state.get("servicio"):
+        await svc.save_state(sender_number, state)
+        await svc.send_message(
+            sender_number,
+            "Indícame qué servicio deseas, qué día prefieres y en qué horario te conviene."
+        )
+        return
+
+    if not state.get("fecha"):
+        await svc.save_state(sender_number, state)
+        await svc.send_message(
+            sender_number,
+            f"Para *{state['servicio']}*, ¿qué día prefieres y en qué horario?"
+        )
+        return
+
+    # Tenemos servicio y fecha → consultar disponibilidad
+    from datetime import date as date_type
+    target_date = svc.parse_fecha(state["fecha"])
+    if not target_date or target_date < date_type.today():
+        state["fecha"] = None
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, "¿Qué día prefieres? (ej: viernes, 15/08)")
+        return
+
+    # Sin domingos
+    if target_date.weekday() == 6:
+        state["fecha"] = None
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, "No atendemos los domingos. ¿Qué otro día te viene bien?")
+        return
+
+    asesora = state.get("asesora") or svc.detect_advisor(state["servicio"]) or "lizbeth"
+    state["asesora"] = asesora
+    state["fecha"] = target_date.strftime("%Y-%m-%d")
+
+    available_slots = await svc.get_available_slots(db, asesora, target_date)
+
+    if not available_slots:
+        state["fecha"] = None
+        await svc.save_state(sender_number, state)
+        fecha_es = svc.format_fecha_es(target_date)
+        await svc.send_message(
+            sender_number,
+            f"No hay disponibilidad el *{fecha_es}*. ¿Qué otro día te viene bien?"
+        )
+        return
+
+    state["slots_disponibles"] = available_slots
+    state["paso"] = "mostrando_horarios"
+    await svc.save_state(sender_number, state)
+
+    fecha_es = svc.format_fecha_es(target_date)
+    await svc.send_message(sender_number, svc.build_slots_message(available_slots, fecha_es))
+
+
+async def _handle_slot_selection(
+    sender_number: str,
+    state: Dict[str, Any],
+    intent_data: Dict[str, Any],
+) -> None:
+    """Procesa la selección de horario y avanza al resumen de confirmación."""
+    available_slots: List[str] = state.get("slots_disponibles", [])
+    slot_num = intent_data.get("slot_num")
+
+    # Selección por número
+    if slot_num and isinstance(slot_num, int) and 1 <= slot_num <= len(available_slots):
+        state["hora"] = available_slots[slot_num - 1]
+        state["paso"] = "esperando_confirmacion"
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, svc.build_summary_message(state))
+        return
+
+    # Selección por hora explícita
+    hora_raw = intent_data.get("hora", "")
+    if hora_raw:
+        try:
+            h_str = hora_raw.lower().replace("am", "").replace("pm", "").strip().split(":")[0]
+            h = int(h_str)
+            if "pm" in hora_raw.lower() and h < 12:
+                h += 12
+            hora_norm = f"{h:02d}:00"
+            if hora_norm in available_slots:
+                state["hora"] = hora_norm
+                state["paso"] = "esperando_confirmacion"
+                await svc.save_state(sender_number, state)
+                await svc.send_message(sender_number, svc.build_summary_message(state))
+                return
+        except (ValueError, IndexError):
+            pass
+
+    # Volver a mostrar las opciones
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post(url, headers=headers, json=payload)
-            if res.status_code == 200:
-                return res.json()["choices"][0]["message"]["content"].strip()
-            return None
+        from datetime import datetime
+        d = datetime.strptime(state["fecha"], "%Y-%m-%d").date()
+        fecha_es = svc.format_fecha_es(d)
     except Exception:
-        return None
+        fecha_es = state.get("fecha", "")
+
+    await svc.send_message(sender_number, svc.build_slots_message(available_slots, fecha_es))
 
 
-def get_client_fallback_reply(sender_name: str, message_text: str) -> str:
-    """Menú interactivo para clientas si OpenAI no está disponible."""
-    text_clean = message_text.lower().strip()
-    nombre = sender_name or "Cliente"
+async def _handle_confirmation_step(
+    sender_number: str,
+    state: Dict[str, Any],
+    intent: str,
+    db: Any,
+) -> None:
+    """Gestiona la confirmación o rechazo del resumen de cita."""
+    if intent == "confirmar":
+        asesora = state.get("asesora") or svc.detect_advisor(state.get("servicio", "")) or "lizbeth"
+        cita = await svc.create_cita(
+            db=db,
+            cliente_phone=sender_number,
+            cliente_nombre=state.get("nombre", ""),
+            servicio=state["servicio"],
+            asesora=asesora,
+            fecha=state["fecha"],
+            hora=state["hora"],
+        )
+        state["cita_id"] = cita.id
+        state["asesora"] = asesora
+        state["paso"] = "esperando_voucher"
+        state["intentos_voucher"] = 0
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, svc.build_advance_message())
 
-    if any(greet in text_clean for greet in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey", "ola", "start", "menu"]):
-        return (
-            f"✨ ¡Hola {nombre}! Bienvenido/a a *Glowlab*.\n\n"
-            "¿En qué podemos consentirte hoy?\n"
-            "1️⃣ *Servicios y Tratamientos*\n"
-            "2️⃣ *Agendar una Cita*\n"
-            "3️⃣ *Precios y Promociones*\n"
-            "4️⃣ *Hablar con un Asesor*\n\n"
-            "Escribe el número de la opción o cuéntanos qué necesitas."
+    elif intent == "rechazar":
+        state["hora"] = None
+        state["fecha"] = None
+        state["paso"] = "recolectando"
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, "Sin problema. ¿Qué día u horario prefieres?")
+
+    else:
+        await svc.send_message(sender_number, "¿Confirmamos la cita? Responde *Sí* o *No*.")
+
+
+async def _handle_voucher_step(
+    sender_number: str,
+    state: Dict[str, Any],
+    message_text: str,
+    message_data: Dict[str, Any],
+    raw_item: Dict[str, Any],
+    intent_data: Dict[str, Any],
+    db: Any,
+) -> None:
+    """Valida el comprobante de pago y confirma o rechaza la cita."""
+    has_image = "imageMessage" in message_data
+
+    # Excepción explícita (no puede pagar el adelanto)
+    if intent_data.get("requiere_excepcion") or any(
+        k in message_text.lower() for k in ("sin adelanto", "no puedo pagar", "excepcion", "excepción")
+    ):
+        state["paso"] = "derivada"
+        await svc.save_state(sender_number, state)
+        await svc.notify_all_staff(
+            f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
+            f"solicita excepción de adelanto.\n"
+            f"Servicio: {state.get('servicio')} | Fecha: {state.get('fecha')} | Hora: {state.get('hora')}"
+        )
+        await svc.send_message(
+            sender_number,
+            "Entiendo. Voy a consultar con una asesora y te avisamos enseguida. 🌸"
+        )
+        return
+
+    if has_image:
+        # Intentar obtener base64 de la imagen
+        image_b64 = await svc.get_media_base64(raw_item)
+        valid = True
+        reason = ""
+
+        if image_b64:
+            valid, reason = await svc.validate_voucher(image_b64)
+
+        if valid:
+            # Confirmar la cita
+            state["adelanto_validado"] = True
+            if state.get("cita_id"):
+                await svc.update_cita_estado(
+                    db, state["cita_id"], "confirmada", adelanto_pagado=True
+                )
+
+            asesora = state.get("asesora", "lizbeth")
+            await svc.notify_advisor(asesora, svc.build_staff_notification(state, sender_number))
+
+            state["paso"] = "cita_confirmada"
+            await svc.save_state(sender_number, state)
+            await svc.send_message(sender_number, svc.build_confirmation_message(state))
+
+        else:
+            # Voucher inválido: reintento o derivar
+            intentos = state.get("intentos_voucher", 0) + 1
+            state["intentos_voucher"] = intentos
+
+            if intentos >= 3:
+                state["paso"] = "derivada"
+                await svc.save_state(sender_number, state)
+                await svc.notify_all_staff(
+                    f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
+                    f"tuvo problemas con el comprobante. Verificar manualmente."
+                )
+                await svc.send_message(
+                    sender_number,
+                    "No pudimos verificar el comprobante. Una asesora te contactará para ayudarte. 🌸"
+                )
+            else:
+                await svc.save_state(sender_number, state)
+                await svc.send_message(
+                    sender_number,
+                    f"No pudimos verificar el comprobante ({reason}). "
+                    "¿Puedes enviarnos una imagen más nítida? 📸"
+                )
+    else:
+        # No enviaron imagen
+        await svc.save_state(sender_number, state)
+        await svc.send_message(
+            sender_number,
+            f"Para confirmar tu cita envíanos la imagen del comprobante de S/ {settings.ADVANCE_AMOUNT}. 📸"
         )
 
-    elif text_clean in ["1", "servicios", "tratamientos", "servicio", "tratamiento"]:
-        return (
-            "💆‍♀️ *Nuestros Servicios en Glowlab:*\n\n"
-            "• Limpieza Facial Profunda & Hidratación\n"
-            "• Tratamientos Anti-Edad & Rejuvenecimiento\n"
-            "• Manicura, Pedicura & Spa\n"
-            "• Masajes Relajantes y Reductores\n\n"
-            "Escribe *2* o *Agendar* para reservar tu turno."
-        )
 
-    elif text_clean in ["2", "cita", "agendar", "reservar", "turno"]:
-        return (
-            "📅 *Agenda tu Cita en Glowlab:*\n\n"
-            "Por favor indícanos:\n"
-            "1. Tu nombre completo\n"
-            "2. Servicio de interés\n"
-            "3. Fecha y hora tentativa\n\n"
-            "Nuestras especialistas *Lizbeth* o *Anali* confirmarán tu cita a la brevedad. ✨"
-        )
+# ============================================================
+# PROCESADOR PRINCIPAL DEL WEBHOOK
+# ============================================================
 
-    elif text_clean in ["3", "precios", "promociones", "costo", "precio", "promocion"]:
-        return (
-            "🏷️ *Promociones del Mes en Glowlab:*\n\n"
-            "✨ *Pack Glow Radiante:* Facial + Hidratación (20% OFF)\n"
-            "✨ *Spa Day Relajante:* Masaje + Manicura Spa\n\n"
-            "¿Deseas información detallada de algún tratamiento?"
-        )
-
-    elif text_clean in ["4", "asesor", "humano", "ayuda", "contacto"]:
-        return (
-            "👤 Hemos notificado a nuestras especialistas *Lizbeth* y *Anali*.\n"
-            "En un momento se comunicarán contigo por este mismo chat. ¡Gracias por tu paciencia!"
-        )
-
-    return (
-        f"Gracias por comunicarte con *Glowlab*, {nombre}. 🌸\n\n"
-        "Hemos recibido tu consulta y una asesora especializada te responderá en breve.\n\n"
-        "Si deseas ver nuestros servicios y agendar de inmediato, escribe *Hola* o *Menu*."
-    )
-
-
-async def handle_client_interaction(sender_number: str, sender_name: str, message_text: str, instance_name: str):
-    """Procesa el mensaje de una clienta y notifica a las trabajadoras si es una cita o consulta."""
-    text_clean = message_text.lower().strip()
-
-    # 1. Intentar responder con IA
-    reply = await get_client_openai_reply(sender_name, message_text)
-    if not reply:
-        reply = get_client_fallback_reply(sender_name, message_text)
-
-    # 2. Enviar respuesta a la clienta
-    await send_whatsapp_message(sender_number, reply, instance_name)
-
-    # 3. Detectar si la clienta quiere agendar cita o hablar con asesor para NOTIFICAR AL STAFF
-    es_solicitud_cita = any(k in text_clean for k in ["cita", "agendar", "reservar", "turno", "precio", "quiero", "2", "4", "asesor"])
-
-    if es_solicitud_cita:
-        notificacion = (
-            f"🔔 *¡Nueva Solicitud de Clienta en Glowlab!* 🔔\n\n"
-            f"👤 *Clienta:* {sender_name or 'Cliente'}\n"
-            f"📱 *WhatsApp:* +{sender_number}\n"
-            f"💬 *Mensaje:* \"{message_text}\"\n\n"
-            f"👉 _Pueden contactarla o confirmar su horario desde este número._"
-        )
-        logger.info(f"Notificando al equipo sobre mensaje de clienta [{sender_number}]")
-        await notify_all_staff(notificacion, instance_name)
-
-
-# ---------------------------------------------------------
-# PROCESADOR PRINCIPAL DE WEBHOOKS
-# ---------------------------------------------------------
-
-def extract_message_items(raw_data: Any) -> List[Dict[str, Any]]:
-    """Normaliza el payload de data tanto si viene como lista o como dict."""
-    if isinstance(raw_data, list):
-        return [item for item in raw_data if isinstance(item, dict)]
-    elif isinstance(raw_data, dict):
-        return [raw_data]
-    return []
-
-
-async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
-    """Enruta los mensajes según el rol (Staff vs Cliente)."""
+async def process_webhook_payload(payload: Dict[str, Any]) -> None:
+    """Enruta cada mensaje entrante según el remitente (staff vs clienta)."""
     try:
-        instance_name = payload.get("instance") or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot") or "glowlab-bot"
-        staff_dict = getattr(settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"})
+        staff_dict: Dict[str, str] = getattr(
+            settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"}
+        )
 
         raw_data = payload.get("data")
-        items = extract_message_items(raw_data)
+        if isinstance(raw_data, list):
+            items = [i for i in raw_data if isinstance(i, dict)]
+        elif isinstance(raw_data, dict):
+            items = [raw_data]
+        else:
+            items = []
 
-        if not items:
-            if "key" in payload and isinstance(payload["key"], dict):
-                items = [payload]
+        # Compatibilidad con estructura plana
+        if not items and "key" in payload and isinstance(payload.get("key"), dict):
+            items = [payload]
 
         for item in items:
             key = item.get("key", {})
             if not isinstance(key, dict):
                 continue
-
-            # Ignorar mensajes enviados por el propio bot
             if key.get("fromMe", False):
                 continue
 
@@ -304,71 +489,67 @@ async def process_incoming_whatsapp_message(payload: Dict[str, Any]):
                 continue
 
             sender_number = remote_jid.split("@")[0]
-            sender_name = item.get("pushName", "")
+            sender_name = item.get("pushName", "") or ""
 
-            # Extraer contenido del mensaje
-            message_data = item.get("message", {})
-            if not isinstance(message_data, dict):
-                continue
+            message_data: Dict[str, Any] = item.get("message", {}) or {}
 
+            # Extraer texto del mensaje
             message_text = ""
-            if "conversation" in message_data and message_data["conversation"]:
+            if message_data.get("conversation"):
                 message_text = str(message_data["conversation"])
-            elif "extendedTextMessage" in message_data and isinstance(message_data["extendedTextMessage"], dict):
+            elif isinstance(message_data.get("extendedTextMessage"), dict):
                 message_text = str(message_data["extendedTextMessage"].get("text", ""))
-            elif "imageMessage" in message_data and isinstance(message_data["imageMessage"], dict):
+            elif isinstance(message_data.get("imageMessage"), dict):
                 message_text = str(message_data["imageMessage"].get("caption", ""))
-            elif "videoMessage" in message_data and isinstance(message_data["videoMessage"], dict):
+            elif isinstance(message_data.get("videoMessage"), dict):
                 message_text = str(message_data["videoMessage"].get("caption", ""))
 
-            if not message_text.strip():
+            # Solo procesamos si hay texto o imagen
+            has_image = "imageMessage" in message_data
+            if not message_text.strip() and not has_image:
                 continue
 
-            # -------------------------------------------------
-            # ENRUTAMIENTO INTELIGENTE POR ROLES:
-            # -------------------------------------------------
+            # ── Enrutamiento por rol ──
             if sender_number in staff_dict:
-                # MODO TRABAJADORA (Lizbeth o Anali)
                 staff_name = staff_dict[sender_number]
-                await handle_staff_interaction(sender_number, staff_name, message_text, instance_name)
+                await handle_staff_message(sender_number, staff_name, message_text)
             else:
-                # MODO CLIENTA
-                await handle_client_interaction(sender_number, sender_name, message_text, instance_name)
+                await handle_client_message(
+                    sender_number, sender_name, message_text, message_data, item
+                )
 
     except Exception as e:
-        logger.error(f"Error procesando mensaje entrante de WhatsApp: {str(e)}", exc_info=True)
+        logger.error(f"Error procesando payload del webhook: {e}", exc_info=True)
 
 
-# ---------------------------------------------------------
+# ============================================================
 # ENDPOINTS FASTAPI
-# ---------------------------------------------------------
+# ============================================================
 
-@router.get("/webhook")
+@router.get("/webhook", summary="Estado del webhook")
 async def verify_webhook():
-    """Endpoint de verificación del webhook."""
+    """Verificación de estado del webhook de WhatsApp."""
     return {
         "status": "online",
-        "service": "Glowlab Dual-Role WhatsApp System",
-        "staff_registered": getattr(settings, "STAFF_MEMBERS", {}),
-        "instance": getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot"),
+        "service": "Glowlab WhatsApp Agent",
+        "instance": settings.EVOLUTION_INSTANCE_NAME,
     }
 
 
-@router.post("/webhook")
-async def receive_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-    """Endpoint receptor universal de eventos de Evolution API."""
+@router.post("/webhook", summary="Receptor de eventos Evolution API")
+async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Endpoint receptor universal de eventos enviados por Evolution API.
+    Responde 200 de inmediato y procesa el mensaje en segundo plano.
+    """
     try:
         payload = await request.json()
     except Exception:
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content="Invalid JSON")
 
     event = str(payload.get("event", "")).lower()
-    logger.info(f"Webhook recibido: Evento=[{event}] Instancia=[{payload.get('instance')}]")
+    logger.info(f"Webhook recibido: [{event}] instancia=[{payload.get('instance')}]")
 
-    # Procesar en segundo plano para responder HTTP 200 de inmediato
-    background_tasks.add_task(process_incoming_whatsapp_message, payload)
+    background_tasks.add_task(process_webhook_payload, payload)
 
     return {"status": "received", "event": payload.get("event")}

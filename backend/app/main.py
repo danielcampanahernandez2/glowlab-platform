@@ -1,40 +1,93 @@
 """Main FastAPI application entry point for Glowlab."""
-from contextlib import asynccontextmanager
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.v1.router import api_v1_router
 from app.core.config import settings
-from app.core.database import check_database_connection
+from app.core.database import check_database_connection, engine, Base
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 
-# Inicializar configuración de logging
+# Importar modelos para que SQLAlchemy los registre antes de create_all
+from app.modules.salon import models as _salon_models  # noqa: F401
+
 setup_logging()
 logger = logging.getLogger("glowlab.main")
 
+# ──────────────────────────────────────────────────────────────
+# SCHEDULER DE RECORDATORIOS
+# ──────────────────────────────────────────────────────────────
+
+def _start_reminder_scheduler() -> None:
+    """Inicia APScheduler para enviar recordatorios y seguimientos automáticos."""
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from app.modules.salon.services import run_reminder_check
+
+        scheduler = AsyncIOScheduler(timezone="America/Lima")
+        # Cada hora en punto
+        scheduler.add_job(run_reminder_check, "cron", minute=0, id="glowlab_reminders")
+        scheduler.start()
+        logger.info("✅ Scheduler de recordatorios iniciado (cada hora).")
+        return scheduler
+    except ImportError:
+        logger.warning("APScheduler no instalado; recordatorios automáticos desactivados.")
+        return None
+    except Exception as e:
+        logger.error(f"Error iniciando scheduler: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# CICLO DE VIDA DE LA APLICACIÓN
+# ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manejo del ciclo de vida de la aplicación (startup y shutdown)."""
-    logger.info(f"Iniciando {settings.PROJECT_NAME} v{settings.VERSION} en modo [{settings.ENVIRONMENT}]")
-    
-    # Comprobación de conectividad a la base de datos al arrancar
+    """Startup y shutdown de la aplicación."""
+    logger.info(
+        f"Iniciando {settings.PROJECT_NAME} v{settings.VERSION} "
+        f"en modo [{settings.ENVIRONMENT}]"
+    )
+
+    # 1. Crear tablas en PostgreSQL (si no existen)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ Tablas de base de datos verificadas / creadas.")
+    except Exception as e:
+        logger.error(f"Error al crear tablas: {e}")
+
+    # 2. Verificar conectividad
     db_connected = await check_database_connection()
     if db_connected:
-        logger.info("Conexión a PostgreSQL establecida con éxito.")
+        logger.info("✅ Conexión a PostgreSQL establecida.")
     else:
-        logger.warning("No se pudo conectar a PostgreSQL al iniciar. Verifique DATABASE_URL.")
+        logger.warning("⚠️  No se pudo conectar a PostgreSQL al iniciar.")
+
+    # 3. Iniciar scheduler de recordatorios
+    scheduler = _start_reminder_scheduler()
 
     yield
 
+    # Shutdown
+    if scheduler:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler de recordatorios detenido.")
     logger.info(f"Cerrando {settings.PROJECT_NAME}...")
 
 
+# ──────────────────────────────────────────────────────────────
+# FÁBRICA DE LA APLICACIÓN
+# ──────────────────────────────────────────────────────────────
+
 def create_application() -> FastAPI:
-    """Fábrica de creación y configuración de la instancia de FastAPI."""
+    """Crea y configura la instancia de FastAPI."""
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
@@ -44,7 +97,7 @@ def create_application() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Configuración de CORS
+    # CORS
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.BACKEND_CORS_ORIGINS,
@@ -53,13 +106,13 @@ def create_application() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Registro de manejadores de excepciones
+    # Manejadores de excepciones
     register_exception_handlers(app)
 
-    # Registrar rutas de API v1
+    # Rutas API v1
     app.include_router(api_v1_router, prefix=settings.API_V1_STR)
 
-    # Endpoint raíz /health para balanceadores de carga y healthchecks rápidos
+    # Health check
     @app.get("/health", tags=["Health"], include_in_schema=False)
     async def root_health():
         db_ok = await check_database_connection()
@@ -75,7 +128,6 @@ def create_application() -> FastAPI:
             },
         )
 
-    # Endpoint raíz / informativo
     @app.get("/", tags=["Root"], include_in_schema=False)
     async def root():
         return {
