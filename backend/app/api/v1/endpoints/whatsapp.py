@@ -6,6 +6,8 @@ Sistema dual de atención:
   • Staff (Lizbeth / Anali) → asistente de agenda interna
 """
 import logging
+import random
+import difflib
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
@@ -15,6 +17,13 @@ from app.core.database import async_session_factory
 from app.modules.salon import services as svc
 
 logger = logging.getLogger("glowlab.whatsapp")
+
+# Greeting variations for a friendly tone
+GREETINGS = [
+    "¡Hola! 💕 Bienvenida a Glowlab! ¿En qué te podemos ayudar hoy?",
+    "¡Hey! 🌸 Bienvenida a Glowlab, cuéntame qué servicio te gustaría reservar.",
+    "¡Buenas! ✨ Bienvenida, ¿qué tratamiento quieres probar?",
+]
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 
@@ -146,19 +155,34 @@ async def handle_client_message(
             state["servicio"] = intent_data["servicio"]
             state["asesora"] = svc.detect_advisor(intent_data["servicio"])
             # Detect and store category for the service (exact name match)
+            # Try exact match first
+            matched = False
             for cat, services in svc.SERVICE_CATALOG.items():
                 if any(s["name"].lower() == state["servicio"].lower() for s in services):
                     state["categoria"] = cat
+                    matched = True
                     break
-            else:
-                # Fallback: infer category from common keywords
-                keyword = state["servicio"].lower()
-                if keyword in ["pestaña", "pestañas", "extensiones", "extension", "lash", "lashes"]:
-                    state["categoria"] = "Pestañas"
-                elif keyword in ["uña", "uñas", "manicure", "pedicure", "gel", "acrílica", "acrilica", "nail", "semipermanente", "semiperm"]:
-                    state["categoria"] = "Uñas"
-                elif keyword in ["capilar", "cabello", "tratamiento", "hidratación", "hidratacion", "keratina", "keratin", "botox", "mechas", "balayage", "corte", "alisado", "tinte"]:
-                    state["categoria"] = "Tratamientos capilares"
+            if not matched:
+                # Fuzzy match against known service names
+                all_names = []
+                for services in svc.SERVICE_CATALOG.values():
+                    all_names.extend([s["name"].lower() for s in services])
+                close = difflib.get_close_matches(state["servicio"].lower(), all_names, n=1, cutoff=0.8)
+                if close:
+                    # Find category of the matched service
+                    for cat, services in svc.SERVICE_CATALOG.items():
+                        if any(s["name"].lower() == close[0] for s in services):
+                            state["categoria"] = cat
+                            break
+                else:
+                    # Fallback keyword heuristics
+                    keyword = state["servicio"].lower()
+                    if keyword in ["pestaña", "pestañas", "extensiones", "extension", "lash", "lashes"]:
+                        state["categoria"] = "Pestañas"
+                    elif keyword in ["uña", "uñas", "manicure", "pedicure", "gel", "acrílica", "acrilica", "nail", "semipermanente", "semiperm"]:
+                        state["categoria"] = "Uñas"
+                    elif keyword in ["capilar", "cabello", "tratamiento", "hidratación", "hidratacion", "keratina", "keratin", "botox", "mechas", "balayage", "corte", "alisado", "tinte"]:
+                        state["categoria"] = "Tratamientos capilares"
 
 
         # Actualizar fecha si se mencionó por primera vez
@@ -206,10 +230,11 @@ async def handle_client_message(
 
         # ── SALUDO SIMPLE (sin datos de reserva aún) ─────────
         if intent == "saludo" and paso == "inicial" and not state.get("servicio"):
-            nombre = (state.get("nombre") or "").split()[0] if state.get("nombre") else ""
-            greeting = f"¡Hola! 💕 Bienvenida a Glowlab! ¿En qué te podemos ayudar hoy?"
-            await svc.save_state(sender_number, state)
-            await svc.send_message(sender_number, greeting)
+            # Ensure we greet only once per conversation
+            if not state.get("saludado"):
+                state["saludado"] = True
+                await svc.save_state(sender_number, state)
+                await svc.send_message(sender_number, random.choice(GREETINGS))
             return
 
         # ── CONSULTA DE PRECIO ────────────────────────────────
@@ -260,14 +285,15 @@ async def _handle_booking_flow(
 
     # If we don't yet know the category, ask for it first
     if not state.get("categoria"):
+        state["paso"] = "esperando_categoria"
         await svc.save_state(sender_number, state)
         await svc.send_message(sender_number, svc.list_services())
         return
     # If we have a category but still need a specific service
     if not state.get("servicio"):
-        cat = state["categoria"]
+        state["paso"] = "esperando_servicio"
         await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, svc.prompt_subservice(cat))
+        await svc.send_message(sender_number, svc.prompt_subservice(state["categoria"]))
         return
 
     if not state.get("fecha"):
