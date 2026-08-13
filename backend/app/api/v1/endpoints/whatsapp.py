@@ -189,13 +189,12 @@ async def handle_client_message(
             )
             return
 
-        # ── INTENCIÓN CLARA DE AGENDAR (Sección 5 y 6) ────────
-        # Informational questions must not discard an in-progress booking.
+        # ── CONSULTA DE PAGO / ADELANTO EN PROCESO DE RESERVA ──
         payment_question = any(
             term in message_text.lower()
             for term in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "pago para reservar", "adelanto", "separar")
         )
-        if payment_question and state.get("servicio"):
+        if payment_question and (state.get("servicio") or paso in ("recolectando_fecha", "mostrando_horarios", "esperando_confirmacion")):
             await svc.save_state(sender_number, state)
             await svc.send_message(sender_number, svc.build_advance_message())
             return
@@ -204,7 +203,7 @@ async def handle_client_message(
         # y NO es una consulta informativa, saludo o cancelación.
         booking_in_progress = (
             intent == "agendar"
-            or (paso == "recolectando_fecha" and (intent_data.get("fecha") or intent in ("otro", "agendar")))
+            or (paso in ("recolectando_fecha", "mostrando_horarios") and (intent_data.get("fecha") or intent in ("otro", "agendar")))
         ) and intent not in ("consultar", "saludo", "cancelar", "excepcion")
 
         if booking_in_progress:
@@ -478,7 +477,8 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
 
             # Evolution can include a device suffix (number:device@...). Keep a
             # stable, canonical key for the same person's conversation.
-            sender_number = remote_jid.split("@")[0].split(":")[0]
+            raw_sender = remote_jid.split("@")[0].split(":")[0]
+            sender_number = svc.normalize_phone(raw_sender)
             sender_name = item.get("pushName", "") or ""
 
             message_data: Dict[str, Any] = item.get("message", {}) or {}

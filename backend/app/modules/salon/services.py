@@ -231,8 +231,13 @@ def format_hora_12h(hora_24: str) -> str:
 
 
 # ============================================================
-# GESTIÓN DE ESTADO CONVERSACIONAL (REDIS)
+# GESTIÓN DE ESTADO CONVERSACIONAL (REDIS + POSTGRESQL)
 # ============================================================
+
+def normalize_phone(phone: str) -> str:
+    """Normaliza un número telefónico conservando solo los dígitos numéricos."""
+    return "".join(filter(str.isdigit, str(phone)))
+
 
 _redis_client = None
 
@@ -254,66 +259,73 @@ async def _get_redis():
 
 async def load_state(phone: str) -> Dict[str, Any]:
     """Carga estado por teléfono; PostgreSQL es la fuente durable y Redis la caché."""
+    phone_norm = normalize_phone(phone)
     durable_state: Dict[str, Any] = {"paso": "inicial"}
     try:
         async with async_session_factory() as db:
-            result = await db.execute(select(Conversacion.estado).where(Conversacion.phone == phone))
+            result = await db.execute(select(Conversacion.estado).where(Conversacion.phone == phone_norm))
             saved = result.scalar_one_or_none()
             if isinstance(saved, dict):
-                durable_state = saved
+                durable_state = dict(saved)
     except Exception as e:
-        logger.warning(f"Error leyendo estado durable ({phone}): {e}")
+        logger.warning(f"Error leyendo estado durable ({phone_norm}): {e}")
 
     try:
         r = await _get_redis()
         if r:
-            raw = await r.get(f"glowlab:conv:{phone}")
+            raw = await r.get(f"glowlab:conv:{phone_norm}")
             if raw:
                 cached = json.loads(raw)
-                if cached.get("updated_at", "") >= durable_state.get("updated_at", ""):
+                if isinstance(cached, dict) and cached.get("updated_at", "") >= durable_state.get("updated_at", ""):
                     return cached
     except Exception as e:
-        logger.warning(f"Error leyendo estado Redis ({phone}): {e}")
+        logger.warning(f"Error leyendo estado Redis ({phone_norm}): {e}")
     return durable_state
 
 
 async def save_state(phone: str, state: Dict[str, Any]) -> None:
     """Persiste el estado en PostgreSQL y actualiza la caché Redis con TTL de 48h."""
+    phone_norm = normalize_phone(phone)
     state["updated_at"] = datetime.utcnow().isoformat()
+    state_to_save = dict(state)
+
     try:
+        from sqlalchemy.orm.attributes import flag_modified
         async with async_session_factory() as db:
-            result = await db.execute(select(Conversacion).where(Conversacion.phone == phone))
+            result = await db.execute(select(Conversacion).where(Conversacion.phone == phone_norm))
             conversation = result.scalar_one_or_none()
             if conversation:
-                conversation.estado = state
+                conversation.estado = state_to_save
+                flag_modified(conversation, "estado")
             else:
-                db.add(Conversacion(phone=phone, estado=state))
+                db.add(Conversacion(phone=phone_norm, estado=state_to_save))
             await db.commit()
     except Exception as e:
-        logger.warning(f"Error guardando estado durable ({phone}): {e}")
+        logger.warning(f"Error guardando estado durable ({phone_norm}): {e}")
 
     try:
         r = await _get_redis()
         if r:
             await r.setex(
-                f"glowlab:conv:{phone}",
+                f"glowlab:conv:{phone_norm}",
                 REDIS_STATE_TTL,
-                json.dumps(state, ensure_ascii=False),
+                json.dumps(state_to_save, ensure_ascii=False),
             )
     except Exception as e:
-        logger.warning(f"Error guardando estado Redis ({phone}): {e}")
+        logger.warning(f"Error guardando estado Redis ({phone_norm}): {e}")
 
 
 async def clear_state(phone: str) -> None:
     """Elimina el estado conversacional de una clienta."""
+    phone_norm = normalize_phone(phone)
     try:
         r = await _get_redis()
         if r:
-            await r.delete(f"glowlab:conv:{phone}")
+            await r.delete(f"glowlab:conv:{phone_norm}")
     except Exception as e:
-        logger.warning(f"Error borrando estado Redis ({phone}): {e}")
+        logger.warning(f"Error borrando estado Redis ({phone_norm}): {e}")
 
-    await save_state(phone, {"paso": "inicial"})
+    await save_state(phone_norm, {"paso": "inicial"})
 
 
 # ============================================================
@@ -417,19 +429,40 @@ async def update_cita_estado(
 # ============================================================
 
 def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
-    """Respuesta de respaldo cuando OpenAI no está disponible."""
+    """Respuesta de respaldo determinista y contextual cuando OpenAI no está disponible."""
     text_low = message.lower().strip()
+    paso = state.get("paso", "inicial")
 
-    # 1. Saludos puros
+    # 1. Consulta sobre pago / adelanto de reserva
+    if any(k in text_low for k in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "adelanto", "pago para reservar", "separar cita")):
+        return build_advance_message()
+
+    # 2. Si el sistema ya tiene horarios disponibles calculados para una fecha
+    if state.get("slots_disponibles"):
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        return build_slots_message(state["slots_disponibles"], fecha_es)
+
+    # 3. Si está en paso de recolectar fecha y ya tiene servicio seleccionado
+    if paso == "recolectando_fecha" and state.get("servicio"):
+        if not any(k in text_low for k in ("hola", "buenos", "buenas", "servicios", "precio", "costo")):
+            return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
+
+    # 4. Si está en espera de confirmación
+    if paso == "esperando_confirmacion" and state.get("servicio") and state.get("hora"):
+        return build_summary_message(state)
+
+    # 5. Saludos puros
     if any(k in text_low for k in ("hola", "buenos dias", "buenas tardes", "buenas noches", "buenas", "hi", "hey")):
         if not any(k in text_low for k in ("precio", "costo", "cuanto", "cuánto", "cita", "reserva", "horario", "botox", "keratina", "uñas", "pestañas", "seco", "dañado", "frizz", "servicios", "catalogo", "catálogo")):
             return "¡Hola! 💕 Bienvenida a Glowlab. ¿En qué te podemos ayudar hoy? ✨"
 
-    # 2. Lista general de servicios / catálogo (Sección 8 y 10)
+    # 6. Lista general de servicios / catálogo (Sección 8 y 10)
     if any(k in text_low for k in ("servicios", "catálogo", "catalogo", "que tienen", "qué tienen", "tratamientos", "opciones", "hacen")):
         return list_services()
 
-    # 3. Recomendación capilar (Sección 9)
+    # 7. Recomendación capilar (Sección 9)
     if any(k in text_low for k in ("seco", "dañado", "frizz", "que me recomiendas", "qué me recomiendas", "maltratado", "caida", "brillo")):
         return (
             "Claro 😊 Si buscas mejorar la hidratación y suavidad del cabello, podemos considerar un tratamiento de hidratación (S/ 80) o botox capilar (S/ 120).\n"
@@ -437,7 +470,7 @@ def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
             "Si quieres, cuéntame cómo tienes actualmente el cabello y te puedo orientar mejor. ✨"
         )
 
-    # 4. Consulta por precio o servicio específico (Sección 11)
+    # 8. Consulta por precio o servicio específico (Sección 11)
     for cat, services in SERVICE_CATALOG.items():
         for svc_item in services:
             svc_name_low = svc_item["name"].lower()
@@ -464,14 +497,14 @@ def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
             if price_msg:
                 return price_msg
 
-    # 5. Agendamiento explícito (Sección 6 y 7)
+    # 9. Agendamiento explícito (Sección 6 y 7)
     if any(k in text_low for k in ("cita", "agendar", "reservar", "separar", "horarios")):
         if not state.get("servicio"):
             return "¡Claro! 😊 ¿Qué servicio deseas realizarte?"
         if not state.get("fecha"):
             return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
 
-    # 6. Respuesta por defecto
+    # 10. Respuesta por defecto
     return (
         "¡Hola! ✨ En Glowlab ofrecemos servicios de pestañas (lashista), uñas (pintado y diseños) y tratamientos capilares (hidratación, keratina, botox capilar e hidratación express).\n\n"
         "Cuéntame qué información necesitas o en qué podemos asesorarte hoy. 💕"
@@ -487,12 +520,13 @@ async def generate_client_reply(
     Genera una respuesta conversacional natural, cálida y profesional para la clienta usando
     OpenAI y el CLIENT_SYSTEM_PROMPT oficial de Glowlab (25 secciones).
     """
-    if not settings.OPENAI_API_KEY:
-        reply = _fallback_client_reply(state, message)
-        history = state.get("history", [])
-        history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": reply})
-        state["history"] = history[-10:]
+    # Si tenemos horarios confirmados en slots_disponibles y OpenAI no está disponible
+    if state.get("slots_disponibles") and not settings.OPENAI_API_KEY:
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        reply = build_slots_message(state["slots_disponibles"], fecha_es)
+        _record_history(state, message, reply)
         return reply
 
     today = date.today()
@@ -522,62 +556,73 @@ async def generate_client_reply(
 
     messages.append({"role": "user", "content": message})
 
-    payload = {
-        "model": settings.OPENAI_MODEL,
-        "messages": messages,
-        "temperature": 0.45,
-        "max_tokens": 450,
-    }
+    if settings.OPENAI_API_KEY:
+        payload = {
+            "model": settings.OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0.45,
+            "max_tokens": 450,
+        }
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            if res.status_code == 200:
-                reply = res.json()["choices"][0]["message"]["content"].strip()
-                history.append({"role": "user", "content": message})
-                history.append({"role": "assistant", "content": reply})
-                state["history"] = history[-10:]
-                return reply
-    except Exception as e:
-        logger.warning(f"Error generando respuesta clienta con OpenAI: {e}")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                if res.status_code == 200:
+                    reply = res.json()["choices"][0]["message"]["content"].strip()
+                    _record_history(state, message, reply)
+                    return reply
+        except Exception as e:
+            logger.warning(f"Error generando respuesta clienta con OpenAI: {e}")
 
-    reply = _fallback_client_reply(state, message)
-    history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": reply})
-    state["history"] = history[-10:]
+    # Fallback contextual inteligente
+    if state.get("slots_disponibles"):
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        reply = build_slots_message(state["slots_disponibles"], fecha_es)
+    else:
+        reply = _fallback_client_reply(state, message)
+
+    _record_history(state, message, reply)
     return reply
 
 
+def _record_history(state: Dict[str, Any], user_msg: str, assistant_msg: str) -> None:
+    """Registra el turno conversacional en el historial del estado."""
+    history = state.get("history", [])
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+    state["history"] = history[-10:]
+
+
 # ============================================================
-# EXTRACCIÓN DE INTENCIÓN (OPENAI)
+# EXTRACCIÓN DE INTENCIÓN (OPENAI + HEURÍSTICA CONTEXTUAL)
 # ============================================================
 
 async def extract_intent(state: Dict[str, Any], message: str) -> Dict[str, Any]:
     """
     Usa OpenAI para extraer intención y entidades del mensaje de la clienta,
-    respetando la jerarquía de intenciones del System Prompt (Secciones 2, 3 y 5).
+    respetando la jerarquía de intenciones del System Prompt (Secciones 2, 3 y 5)
+    e inyectando el historial conversacional previo.
     """
-    if not settings.OPENAI_API_KEY:
-        return _keyword_extract(message)
-
-    ctx = f"Estado: {state.get('paso', 'inicial')}"
+    ctx = f"Estado actual: {state.get('paso', 'inicial')}"
     if state.get("servicio"):
-        ctx += f" | Servicio: {state['servicio']}"
+        ctx += f" | Servicio en curso: {state['servicio']}"
     if state.get("fecha"):
-        ctx += f" | Fecha: {state['fecha']}"
+        ctx += f" | Fecha en curso: {state['fecha']}"
 
     system = (
         "Eres un analizador de intenciones de WhatsApp para el salón de belleza Glowlab.\n"
         "Reglas para clasificar 'intent':\n"
-        "- 'consultar': si la clienta pregunta precios, qué incluye un servicio, pide recomendación, tiene dudas o compara servicios (ej: 'cuánto cuesta el botox', 'tengo el pelo seco qué me recomiendas', 'qué servicios tienen'). NO lo clasifiques como 'agendar' a menos que explícitamente exprese intención de reservar/agendar.\n"
-        "- 'agendar': SOLO si la clienta manifiesta intención clara de reservar o consultar disponibilidad (ej: 'quiero sacar cita', 'quiero reservar', '¿tienen disponibilidad el sábado?', 'qué horarios tienen', 'quiero agendar para mañana').\n"
+        "- 'consultar': si la clienta pregunta precios, qué incluye un servicio, pide recomendación, tiene dudas o compara servicios.\n"
+        "- 'agendar': si la clienta manifiesta intención de reservar, consultar disponibilidad, o si responde con un día/fecha a la pregunta del bot sobre qué día prefiere.\n"
         "- 'saludo': si solo saluda sin hacer una pregunta específica ni pedir servicio.\n"
         "- 'confirmar': si confirma datos o cita ('sí', 'confirmo', 'de acuerdo', 'está bien', 'dale').\n"
         "- 'rechazar': si cancela o rechaza opción ('no', 'cambiar', 'otro').\n"
@@ -587,52 +632,69 @@ async def extract_intent(state: Dict[str, Any], message: str) -> Dict[str, Any]:
         "Responde ÚNICAMENTE con JSON válido con estas claves:\n"
         "{\n"
         "  \"intent\": \"consultar\" | \"agendar\" | \"saludo\" | \"confirmar\" | \"rechazar\" | \"cancelar\" | \"excepcion\" | \"otro\",\n"
-        "  \"servicio\": string o null (ej: 'botox capilar', 'keratina', 'uñas pintado', 'extensiones naturales'),\n"
-        "  \"fecha\": string o null (ej: 'sábado', 'mañana', '15/08', 'YYYY-MM-DD'),\n"
+        "  \"servicio\": string o null (ej: 'pestañas', 'botox capilar', 'keratina', 'uñas'),\n"
+        "  \"fecha\": string o null (ej: 'sábado', 'lunes', 'mañana', '15/08', 'YYYY-MM-DD'),\n"
         "  \"hora\": string o null (ej: 'mañana', 'tarde', '10am', '3pm', '16:00'),\n"
         "  \"slot_num\": entero o null (si elige opción numerada como 1, 2),\n"
         "  \"requiere_excepcion\": boolean\n"
         "}"
     )
 
-    payload = {
-        "model": settings.OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"{ctx}\nMensaje: {message}"},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 250,
-        "response_format": {"type": "json_object"},
-    }
+    if settings.OPENAI_API_KEY:
+        messages = [{"role": "system", "content": system}]
+        history = state.get("history", [])
+        for msg in history[-4:]:
+            if isinstance(msg, dict) and msg.get("role") in ("user", "assistant") and msg.get("content"):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": f"Contexto: {ctx}\nMensaje: {message}"})
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            if res.status_code == 200:
-                data = res.json()["choices"][0]["message"]["content"]
-                return json.loads(data)
-    except Exception as e:
-        logger.warning(f"Error extrayendo intención con OpenAI: {e}")
+        payload = {
+            "model": settings.OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 250,
+            "response_format": {"type": "json_object"},
+        }
 
-    return _keyword_extract(message)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                if res.status_code == 200:
+                    data = res.json()["choices"][0]["message"]["content"]
+                    return json.loads(data)
+        except Exception as e:
+            logger.warning(f"Error extrayendo intención con OpenAI: {e}")
+
+    return _keyword_extract(message, state)
 
 
-def _keyword_extract(message: str) -> Dict[str, Any]:
-    """Extracción de intención por palabras clave (fallback sin IA)."""
+def _keyword_extract(message: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Extracción de intención por palabras clave contextual (fallback sin IA)."""
     s = message.lower()
+    state = state or {}
+    paso = state.get("paso", "inicial")
+
+    # Fecha mencionada
+    fecha = None
+    for fkw in ("hoy", "mañana", "manana", "pasado mañana", "lunes", "martes", "miercoles", "miércoles", "jueves", "viernes", "sabado", "sábado", "domingo"):
+        if fkw in s:
+            fecha = fkw
+            break
 
     # Prioridad: consultas informativas primero (Regla 2 y 3)
     if any(k in s for k in ("precio", "costo", "cuánto", "cuanto", "vale", "cobran", "información", "informacion", "qué incluye", "que incluye", "recomiendas", "recomendación", "seco", "dañado", "frizz", "diferencia", "servicios", "catálogo", "catalogo")):
         intent = "consultar"
     elif any(k in s for k in ("cita", "agendar", "reservar", "turno", "separar", "disponibilidad", "horarios", "quiero reservar", "sacar cita")):
+        intent = "agendar"
+    elif fecha and (paso in ("recolectando_fecha", "mostrando_horarios") or state.get("servicio")):
+        # Si el usuario responde con un día durante el flujo de reserva, la intención es agendar
         intent = "agendar"
     elif any(k in s for k in ("cancelar", "anular", "cancel")):
         intent = "cancelar"
@@ -659,13 +721,6 @@ def _keyword_extract(message: str) -> Dict[str, Any]:
     for kw in sorted(SERVICE_TO_ADVISOR.keys(), key=len, reverse=True):
         if kw in s:
             servicio = kw
-            break
-
-    # Fecha mencionada
-    fecha = None
-    for fkw in ("hoy", "mañana", "manana", "pasado mañana", "lunes", "martes", "miercoles", "miércoles", "jueves", "viernes", "sabado", "sábado", "domingo"):
-        if fkw in s:
-            fecha = fkw
             break
 
     return {
