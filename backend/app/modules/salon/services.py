@@ -428,49 +428,25 @@ async def update_cita_estado(
 # GENERACIÓN DE RESPUESTAS CONVERSACIONALES (OPENAI + CLIENT SYSTEM PROMPT)
 # ============================================================
 
+# ============================================================
+# GENERACIÓN DE RESPUESTAS CONVERSACIONALES (OPENAI + CLIENT SYSTEM PROMPT)
+# ============================================================
+
 def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
     """Respuesta de respaldo determinista y contextual cuando OpenAI no está disponible."""
     text_low = message.lower().strip()
     paso = state.get("paso", "inicial")
 
-    # 1. Consulta sobre pago / adelanto de reserva
-    if any(k in text_low for k in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "adelanto", "pago para reservar", "separar cita")):
-        return build_advance_message()
-
-    # 2. Si el sistema ya tiene horarios disponibles calculados para una fecha
-    if state.get("slots_disponibles"):
-        fecha_str = state.get("fecha", "")
-        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
-        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
-        return build_slots_message(state["slots_disponibles"], fecha_es)
-
-    # 3. Si está en paso de recolectar fecha y ya tiene servicio seleccionado
-    if paso == "recolectando_fecha" and state.get("servicio"):
-        if not any(k in text_low for k in ("hola", "buenos", "buenas", "servicios", "precio", "costo")):
-            return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
-
-    # 4. Si está en espera de confirmación
-    if paso == "esperando_confirmacion" and state.get("servicio") and state.get("hora"):
-        return build_summary_message(state)
-
-    # 5. Saludos puros
+    # 1. Saludos puros (Prioridad 1: Siempre responder al saludo sin forzar slots)
     if any(k in text_low for k in ("hola", "buenos dias", "buenas tardes", "buenas noches", "buenas", "hi", "hey")):
         if not any(k in text_low for k in ("precio", "costo", "cuanto", "cuánto", "cita", "reserva", "horario", "botox", "keratina", "uñas", "pestañas", "seco", "dañado", "frizz", "servicios", "catalogo", "catálogo")):
             return "¡Hola! 💕 Bienvenida a Glowlab. ¿En qué te podemos ayudar hoy? ✨"
 
-    # 6. Lista general de servicios / catálogo (Sección 8 y 10)
+    # 2. Lista general de servicios / catálogo (Prioridad 2: Responder preguntas de servicios)
     if any(k in text_low for k in ("servicios", "catálogo", "catalogo", "que tienen", "qué tienen", "tratamientos", "opciones", "hacen")):
         return list_services()
 
-    # 7. Recomendación capilar (Sección 9)
-    if any(k in text_low for k in ("seco", "dañado", "frizz", "que me recomiendas", "qué me recomiendas", "maltratado", "caida", "brillo")):
-        return (
-            "Claro 😊 Si buscas mejorar la hidratación y suavidad del cabello, podemos considerar un tratamiento de hidratación (S/ 80) o botox capilar (S/ 120).\n"
-            "Si además buscas un efecto más intenso de control de frizz y restauración, el tratamiento de keratina (S/ 160) es excelente.\n\n"
-            "Si quieres, cuéntame cómo tienes actualmente el cabello y te puedo orientar mejor. ✨"
-        )
-
-    # 8. Consulta por precio o servicio específico (Sección 11)
+    # 3. Consulta sobre precio o servicio específico (Sección 11)
     for cat, services in SERVICE_CATALOG.items():
         for svc_item in services:
             svc_name_low = svc_item["name"].lower()
@@ -490,21 +466,60 @@ def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
                         f"Si deseas, puedo orientarte con más información o disponibilidad. 😊"
                     )
 
-    # Coincidencia por palabra clave de servicio si no se encontró el nombre completo
+    # Coincidencia por palabra clave de servicio
     for kw in sorted(SERVICE_TO_ADVISOR.keys(), key=len, reverse=True):
         if kw in text_low and len(kw) > 3:
             price_msg = get_service_price(kw)
             if price_msg:
                 return price_msg
 
-    # 9. Agendamiento explícito (Sección 6 y 7)
-    if any(k in text_low for k in ("cita", "agendar", "reservar", "separar", "horarios")):
+    # 4. Recomendación capilar (Sección 9)
+    if any(k in text_low for k in ("seco", "dañado", "frizz", "que me recomiendas", "qué me recomiendas", "maltratado", "caida", "brillo")):
+        return (
+            "Claro 😊 Si buscas mejorar la hidratación y suavidad del cabello, podemos considerar un tratamiento de hidratación (S/ 80) o botox capilar (S/ 120).\n"
+            "Si además buscas un efecto más intenso de control de frizz y restauración, el tratamiento de keratina (S/ 160) es excelente.\n\n"
+            "Si quieres, cuéntame cómo tienes actualmente el cabello y te puedo orientar mejor. ✨"
+        )
+
+    # 5. Consulta sobre pago / adelanto de reserva
+    if any(k in text_low for k in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "adelanto", "pago para reservar", "separar cita")):
+        return build_advance_message()
+
+    # 6. Solicitud de horarios / disponibilidad explícita cuando hay slots calculados
+    if any(k in text_low for k in ("horario", "horarios", "disponibilidad", "qué hora", "que hora", "a qué hora", "a que hora")) and state.get("slots_disponibles"):
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        return build_slots_message(state["slots_disponibles"], fecha_es)
+
+    # 7. Agendamiento explícito (Sección 6 y 7)
+    if any(k in text_low for k in ("cita", "agendar", "reservar", "separar")):
         if not state.get("servicio"):
             return "¡Claro! 😊 ¿Qué servicio deseas realizarte?"
         if not state.get("fecha"):
             return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
+        if state.get("slots_disponibles"):
+            fecha_str = state.get("fecha", "")
+            fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+            fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+            return build_slots_message(state["slots_disponibles"], fecha_es)
 
-    # 10. Respuesta por defecto
+    # 8. Si está en espera de confirmación y el usuario responde afirmativamente
+    if paso == "esperando_confirmacion" and state.get("servicio") and state.get("hora"):
+        return build_summary_message(state)
+
+    # 9. Si está esperando fecha
+    if paso == "recolectando_fecha" and state.get("servicio"):
+        return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
+
+    # 10. Si está mostrando horarios y el usuario envió un mensaje relacionado
+    if paso == "mostrando_horarios" and state.get("slots_disponibles"):
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        return build_slots_message(state["slots_disponibles"], fecha_es)
+
+    # 11. Respuesta por defecto
     return (
         "¡Hola! ✨ En Glowlab ofrecemos servicios de pestañas (lashista), uñas (pintado y diseños) y tratamientos capilares (hidratación, keratina, botox capilar e hidratación express).\n\n"
         "Cuéntame qué información necesitas o en qué podemos asesorarte hoy. 💕"
@@ -520,15 +535,6 @@ async def generate_client_reply(
     Genera una respuesta conversacional natural, cálida y profesional para la clienta usando
     OpenAI y el CLIENT_SYSTEM_PROMPT oficial de Glowlab (25 secciones).
     """
-    # Si tenemos horarios confirmados en slots_disponibles y OpenAI no está disponible
-    if state.get("slots_disponibles") and not settings.OPENAI_API_KEY:
-        fecha_str = state.get("fecha", "")
-        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
-        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
-        reply = build_slots_message(state["slots_disponibles"], fecha_es)
-        _record_history(state, message, reply)
-        return reply
-
     today = date.today()
     today_formatted = format_fecha_es(today)
 
@@ -581,12 +587,17 @@ async def generate_client_reply(
         except Exception as e:
             logger.warning(f"Error generando respuesta clienta con OpenAI: {e}")
 
-    # Fallback contextual inteligente
-    if state.get("slots_disponibles"):
+    # Fallback determinista contextual
+    if extra_context and "Disponibilidad confirmada" in extra_context and state.get("slots_disponibles"):
         fecha_str = state.get("fecha", "")
         fecha_obj = parse_fecha(fecha_str) if fecha_str else None
         fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
         reply = build_slots_message(state["slots_disponibles"], fecha_es)
+    elif extra_context and "NO HAY HORARIOS DISPONIBLES" in extra_context:
+        fecha_str = state.get("fecha", "")
+        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+        reply = f"Para el {fecha_es} no tenemos horarios disponibles en este momento. 🌸 ¿Te gustaría revisar otro día?"
     else:
         reply = _fallback_client_reply(state, message)
 
