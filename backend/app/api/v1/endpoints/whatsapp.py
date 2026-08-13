@@ -145,11 +145,21 @@ async def handle_client_message(
         if intent_data.get("servicio") and not state.get("servicio"):
             state["servicio"] = intent_data["servicio"]
             state["asesora"] = svc.detect_advisor(intent_data["servicio"])
-            # Detect and store category for the service
+            # Detect and store category for the service (exact name match)
             for cat, services in svc.SERVICE_CATALOG.items():
                 if any(s["name"].lower() == state["servicio"].lower() for s in services):
                     state["categoria"] = cat
                     break
+            else:
+                # Fallback: infer category from common keywords
+                keyword = state["servicio"].lower()
+                if keyword in ["pestaña", "pestañas", "extensiones", "extension", "lash", "lashes"]:
+                    state["categoria"] = "Pestañas"
+                elif keyword in ["uña", "uñas", "manicure", "pedicure", "gel", "acrílica", "acrilica", "nail", "semipermanente", "semiperm"]:
+                    state["categoria"] = "Uñas"
+                elif keyword in ["capilar", "cabello", "tratamiento", "hidratación", "hidratacion", "keratina", "keratin", "botox", "mechas", "balayage", "corte", "alisado", "tinte"]:
+                    state["categoria"] = "Tratamientos capilares"
+
 
         # Actualizar fecha si se mencionó por primera vez
         if intent_data.get("fecha") and not state.get("fecha"):

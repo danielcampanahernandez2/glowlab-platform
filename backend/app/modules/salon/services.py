@@ -102,13 +102,11 @@ SERVICE_CATALOG: Dict[str, List[Dict[str, Any]]] = {
     "Pestañas": [
         {"name": "Extensiones naturales", "desc": "Look natural", "price": 80},
         {"name": "Extensiones más definidas", "desc": "Mayor volumen", "price": 100},
-        {"name": "Estilo a medida", "desc": "Según petición", "price": 0},
+        {"name": "Estilo a medida", "desc": "Rápido y efectivo", "price": 50},
     ],
     "Tratamientos capilares": [
-        {"name": "Hidratación", "desc": "Para cabello seco", "price": 70},
-        {"name": "Keratin", "desc": "Control de frizz", "price": 120},
-        {"name": "Botox capilar", "desc": "Mayor suavidad", "price": 110},
-        {"name": "Hidratación express", "desc": "Rápido y efectivo", "price": 50},
+        {"name": "Alisado", "desc": "Alisamiento profesional", "price": 150},
+        {"name": "Hidratación profunda", "desc": "Nutrición para el cabello", "price": 80},
     ],
 }
 
