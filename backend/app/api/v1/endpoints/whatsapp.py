@@ -145,6 +145,11 @@ async def handle_client_message(
         if intent_data.get("servicio") and not state.get("servicio"):
             state["servicio"] = intent_data["servicio"]
             state["asesora"] = svc.detect_advisor(intent_data["servicio"])
+            # Detect and store category for the service
+            for cat, services in svc.SERVICE_CATALOG.items():
+                if any(s["name"].lower() == state["servicio"].lower() for s in services):
+                    state["categoria"] = cat
+                    break
 
         # Actualizar fecha si se mencionó por primera vez
         if intent_data.get("fecha") and not state.get("fecha"):
@@ -192,17 +197,29 @@ async def handle_client_message(
         # ── SALUDO SIMPLE (sin datos de reserva aún) ─────────
         if intent == "saludo" and paso == "inicial" and not state.get("servicio"):
             nombre = (state.get("nombre") or "").split()[0] if state.get("nombre") else ""
-            greeting = f"¡Hola{' ' + nombre if nombre else ''}! 🌸 ¿En qué te ayudamos hoy?"
+            greeting = f"¡Hola! 💕 Bienvenida a Glowlab! ¿En qué te podemos ayudar hoy?"
             await svc.save_state(sender_number, state)
             await svc.send_message(sender_number, greeting)
             return
 
         # ── CONSULTA DE PRECIO ────────────────────────────────
         if intent == "consultar":
-            await svc.send_message(
-                sender_number,
-                "Indícanos qué servicio te interesa y te damos el detalle de precios. 💅"
-            )
+            # Intent to ask for price or service details
+            service_name = intent_data.get("servicio") or state.get("servicio")
+            # Actualizar categoría si se conoce el servicio
+            if state.get("servicio"):
+                # Detect which category the service belongs to
+                for cat, services in svc.SERVICE_CATALOG.items():
+                    if any(s["name"].lower() == state["servicio"].lower() for s in services):
+                        state["categoria"] = cat
+                        break
+            if service_name:
+                price_msg = svc.get_service_price(service_name)
+                if price_msg:
+                    await svc.send_message(sender_number, price_msg)
+                    return
+            # If no specific service yet, send list of categories
+            await svc.send_message(sender_number, svc.list_services())
             return
 
         # ── CANCELACIÓN ───────────────────────────────────────
@@ -231,19 +248,23 @@ async def _handle_booking_flow(
     """Recoge datos de la reserva y avanza el flujo cuando están completos."""
     state["paso"] = "recolectando"
 
-    if not state.get("servicio"):
+    # If we don't yet know the category, ask for it first
+    if not state.get("categoria"):
         await svc.save_state(sender_number, state)
-        await svc.send_message(
-            sender_number,
-            "Indícame qué servicio deseas, qué día prefieres y en qué horario te conviene."
-        )
+        await svc.send_message(sender_number, svc.list_services())
+        return
+    # If we have a category but still need a specific service
+    if not state.get("servicio"):
+        cat = state["categoria"]
+        await svc.save_state(sender_number, state)
+        await svc.send_message(sender_number, svc.prompt_subservice(cat))
         return
 
     if not state.get("fecha"):
         await svc.save_state(sender_number, state)
         await svc.send_message(
             sender_number,
-            f"Para *{state['servicio']}*, ¿qué día prefieres y en qué horario?"
+            f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
         )
         return
 
@@ -363,7 +384,7 @@ async def _handle_confirmation_step(
         state["fecha"] = None
         state["paso"] = "recolectando"
         await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, "Sin problema. ¿Qué día u horario prefieres?")
+        await svc.send_message(sender_number, "Sin problema. ¿Qué día y horario prefieres?")
 
     else:
         await svc.send_message(sender_number, "¿Confirmamos la cita? Responde *Sí* o *No*.")

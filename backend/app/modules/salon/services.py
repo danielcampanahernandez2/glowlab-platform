@@ -88,6 +88,73 @@ MONTHS_ES: Dict[int, str] = {
 
 REDIS_STATE_TTL = 60 * 60 * 48   # 48 horas
 
+# ============================================================
+# SERVICE CATALOG
+# ============================================================
+
+# Structured catalog: category -> list of services with details
+SERVICE_CATALOG: Dict[str, List[Dict[str, Any]]] = {
+    "Uñas": [
+        {"name": "Manicure", "desc": "Pintado sencillo de uñas", "price": 30},
+        {"name": "Diseños y decoración", "desc": "Arte y decoración personalizada", "price": 45},
+        {"name": "Otros servicios de uñas", "desc": "Según disponibilidad", "price": 0},
+    ],
+    "Pestañas": [
+        {"name": "Extensiones naturales", "desc": "Look natural", "price": 80},
+        {"name": "Extensiones más definidas", "desc": "Mayor volumen", "price": 100},
+        {"name": "Estilo a medida", "desc": "Según petición", "price": 0},
+    ],
+    "Tratamientos capilares": [
+        {"name": "Hidratación", "desc": "Para cabello seco", "price": 70},
+        {"name": "Keratin", "desc": "Control de frizz", "price": 120},
+        {"name": "Botox capilar", "desc": "Mayor suavidad", "price": 110},
+        {"name": "Hidratación express", "desc": "Rápido y efectivo", "price": 50},
+    ],
+}
+
+# Helper to fetch price string for a given service (case‑insensitive)
+def get_service_price(service_name: str) -> Optional[str]:
+    """Return a formatted price message for *service_name* if found.
+    The search is case‑insensitive and matches any service name within the catalog.
+    """
+    lowered = service_name.lower()
+    for cat_services in SERVICE_CATALOG.values():
+        for svc in cat_services:
+            if svc["name"].lower() == lowered:
+                price = svc.get("price", 0)
+                if price:
+                    return f"💅 {svc['name']} tiene un precio de S/ {price}."
+                else:
+                    return f"💅 {svc['name']} está disponible bajo consulta."
+    return None
+
+# Build a friendly list of top‑level categories for the client
+def list_services() -> str:
+    """Return a short, emoji‑rich listing of service categories.
+    Example:
+        "¡Hola! 💕 Bienvenida a Glowlab!\n¿Qué servicio estás buscando?\n👁️ 1. Pestañas\n💅 2. Uñas\n💇‍♀️ 3. Tratamientos capilares"
+    """
+    lines = ["¡Hola! 💕 Bienvenida a Glowlab!", "¿Qué servicio estás buscando?"]
+    emojis = ["👁️", "💅", "💇‍♀️"]
+    for i, cat in enumerate(SERVICE_CATALOG.keys()):
+        lines.append(f"{emojis[i]} {i+1}. {cat}")
+    return "\n".join(lines)
+
+# Prompt for a specific sub‑service after the user picks a category
+def prompt_subservice(category: str) -> str:
+    """Return a tailored question asking which sub‑service the client wants.
+    The wording follows the style requested by the user.
+    """
+    cat_key = category.title()
+    if cat_key not in SERVICE_CATALOG:
+        return "¿Qué servicio deseas?"
+    if cat_key == "Uñas":
+        return "¡Claro! 💅 ¿Te gustaría un pintado sencillo o buscas algún diseño/decoración?"
+    if cat_key == "Pestañas":
+        return "¡Perfecto! ✨ En pestañas podemos ayudarte con diferentes opciones. ¿Buscas algo natural, más definido o tienes algún estilo específico en mente?"
+    if cat_key == "Tratamientos capilares":
+        return "¡Claro! 💇‍♀️ Tenemos varios tratamientos. ¿Qué buscas principalmente: hidratar, controlar el frizz, mejorar la apariencia o algo rápido?"
+    return "¿Qué sub‑servicio deseas?"
 
 # ============================================================
 # UTILIDADES DE FECHA
