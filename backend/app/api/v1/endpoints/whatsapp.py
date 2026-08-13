@@ -2,8 +2,8 @@
 WhatsApp Webhook — Glowlab Conversational Agent.
 
 Sistema dual de atención:
-  • Clientas → máquina de estados conversacional con flujo de reservas
-  • Staff (Lizbeth / Anali) → asistente de agenda interna
+  • Clientas → Asistente virtual de atención y reservas con System Prompt oficial (25 secciones)
+  • Staff (Lizbeth / Anali) → Asistente de agenda interna
 """
 import logging
 import random
@@ -15,32 +15,11 @@ from fastapi import APIRouter, BackgroundTasks, Request, Response, status
 from app.core.config import settings
 from app.core.database import async_session_factory
 from app.modules.salon import services as svc
+from app.modules.salon.prompts import CLIENT_SYSTEM_PROMPT, STAFF_SYSTEM_PROMPT
 
 logger = logging.getLogger("glowlab.whatsapp")
 
-# Greeting variations for a friendly tone
-GREETINGS = [
-    "¡Hola! 💕 Bienvenida a Glowlab! ¿En qué te podemos ayudar hoy?",
-    "¡Hey! 🌸 Bienvenida a Glowlab, cuéntame qué servicio te gustaría reservar.",
-    "¡Buenas! ✨ Bienvenida, ¿qué tratamiento quieres probar?",
-]
-
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
-
-
-# ============================================================
-# PROMPT DE SISTEMA PARA STAFF
-# ============================================================
-
-STAFF_SYSTEM_PROMPT = """Eres el asistente de agenda interno de "Glowlab".
-Estás hablando con una especialista del equipo.
-
-Tu función:
-1. Registrar cambios en su disponibilidad y horarios.
-2. Confirmar con exactitud qué días y horas quedan activos o bloqueados.
-3. Responder con tono profesional, claro y de apoyo.
-
-Responde de forma breve y precisa."""
 
 
 # ============================================================
@@ -112,7 +91,7 @@ async def handle_staff_message(
 
 
 # ============================================================
-# MANEJADOR: CLIENTAS — MÁQUINA DE ESTADOS
+# MANEJADOR: CLIENTAS (CONVERSACIONAL + ATENCIÓN HUMANA)
 # ============================================================
 
 async def handle_client_message(
@@ -123,12 +102,8 @@ async def handle_client_message(
     raw_item: Dict[str, Any],
 ) -> None:
     """
-    Máquina de estados conversacional para clientas.
-
-    Pasos del flujo de reserva:
-        inicial → recolectando → mostrando_horarios
-        → esperando_confirmacion → esperando_voucher
-        → cita_confirmada | derivada
+    Atención conversacional de clientas según el System Prompt oficial de Glowlab (25 secciones).
+    Prioriza responder dudas/precios/recomendaciones antes de iniciar reservas.
     """
     async with async_session_factory() as db:
         state = await svc.load_state(sender_number)
@@ -146,54 +121,9 @@ async def handle_client_message(
             )
             return
 
-        # ── EXTRACCIÓN DE INTENCIÓN ───────────────────────────
-        intent_data = await svc.extract_intent(state, message_text)
-        intent = intent_data.get("intent", "otro")
-
-        # Actualizar servicio si se mencionó por primera vez
-        if intent_data.get("servicio") and not state.get("servicio"):
-            state["servicio"] = intent_data["servicio"]
-            state["asesora"] = svc.detect_advisor(intent_data["servicio"])
-            # Detect and store category for the service (exact name match)
-            # Try exact match first
-            matched = False
-            for cat, services in svc.SERVICE_CATALOG.items():
-                if any(s["name"].lower() == state["servicio"].lower() for s in services):
-                    state["categoria"] = cat
-                    matched = True
-                    break
-            if not matched:
-                # Fuzzy match against known service names
-                all_names = []
-                for services in svc.SERVICE_CATALOG.values():
-                    all_names.extend([s["name"].lower() for s in services])
-                close = difflib.get_close_matches(state["servicio"].lower(), all_names, n=1, cutoff=0.8)
-                if close:
-                    # Find category of the matched service
-                    for cat, services in svc.SERVICE_CATALOG.items():
-                        if any(s["name"].lower() == close[0] for s in services):
-                            state["categoria"] = cat
-                            break
-                else:
-                    # Fallback keyword heuristics
-                    keyword = state["servicio"].lower()
-                    if keyword in ["pestaña", "pestañas", "extensiones", "extension", "lash", "lashes"]:
-                        state["categoria"] = "Pestañas"
-                    elif keyword in ["uña", "uñas", "manicure", "pedicure", "gel", "acrílica", "acrilica", "nail", "semipermanente", "semiperm"]:
-                        state["categoria"] = "Uñas"
-                    elif keyword in ["capilar", "cabello", "tratamiento", "hidratación", "hidratacion", "keratina", "keratin", "botox", "mechas", "balayage", "corte", "alisado", "tinte"]:
-                        state["categoria"] = "Tratamientos capilares"
-
-
-        # Actualizar fecha si se mencionó por primera vez
-        if intent_data.get("fecha") and not state.get("fecha"):
-            from datetime import date
-            parsed = svc.parse_fecha(intent_data["fecha"])
-            if parsed and parsed >= date.today():
-                state["fecha"] = parsed.strftime("%Y-%m-%d")
-
         # ── ESTADO: ESPERANDO VOUCHER ─────────────────────────
         if paso == "esperando_voucher":
+            intent_data = await svc.extract_intent(state, message_text)
             await _handle_voucher_step(
                 sender_number, state, message_text,
                 message_data, raw_item, intent_data, db
@@ -202,17 +132,39 @@ async def handle_client_message(
 
         # ── ESTADO: ESPERANDO CONFIRMACIÓN DEL RESUMEN ───────
         if paso == "esperando_confirmacion":
+            intent_data = await svc.extract_intent(state, message_text)
+            intent = intent_data.get("intent", "otro")
             await _handle_confirmation_step(sender_number, state, intent, db)
             return
 
         # ── ESTADO: MOSTRANDO HORARIOS ────────────────────────
         if paso == "mostrando_horarios":
-            await _handle_slot_selection(sender_number, state, intent_data)
-            return
+            intent_data = await svc.extract_intent(state, message_text)
+            intent = intent_data.get("intent", "otro")
+            # Si el usuario hace una pregunta o cambia de tema en vez de elegir horario
+            if intent not in ("consultar", "cancelar", "excepcion") and (intent_data.get("slot_num") or intent_data.get("hora") or intent in ("confirmar", "rechazar")):
+                await _handle_slot_selection(sender_number, state, intent_data)
+                return
 
-        # ── ESTADO: CITA CONFIRMADA (nueva conversación) ─────
+        # ── ESTADO: CITA CONFIRMADA (reinicio para nueva consulta) ─
         if paso == "cita_confirmada":
             state = {"paso": "inicial", "nombre": state.get("nombre") or sender_name}
+
+        # ── EXTRACCIÓN DE INTENCIÓN Y ENTIDADES ───────────────
+        intent_data = await svc.extract_intent(state, message_text)
+        intent = intent_data.get("intent", "otro")
+
+        # Actualizar servicio si fue mencionado
+        if intent_data.get("servicio"):
+            state["servicio"] = intent_data["servicio"]
+            state["asesora"] = svc.detect_advisor(intent_data["servicio"])
+
+        # Actualizar fecha si fue mencionada
+        if intent_data.get("fecha"):
+            from datetime import date
+            parsed = svc.parse_fecha(intent_data["fecha"])
+            if parsed and parsed >= date.today():
+                state["fecha"] = parsed.strftime("%Y-%m-%d")
 
         # ── EXCEPCIÓN EXPLÍCITA ───────────────────────────────
         if intent_data.get("requiere_excepcion") or intent == "excepcion":
@@ -228,35 +180,6 @@ async def handle_client_message(
             )
             return
 
-        # ── SALUDO SIMPLE (sin datos de reserva aún) ─────────
-        if intent == "saludo" and paso == "inicial" and not state.get("servicio"):
-            # Ensure we greet only once per conversation
-            if not state.get("saludado"):
-                state["saludado"] = True
-                await svc.save_state(sender_number, state)
-                await svc.send_message(sender_number, random.choice(GREETINGS))
-            return
-
-        # ── CONSULTA DE PRECIO ────────────────────────────────
-        if intent == "consultar":
-            # Intent to ask for price or service details
-            service_name = intent_data.get("servicio") or state.get("servicio")
-            # Actualizar categoría si se conoce el servicio
-            if state.get("servicio"):
-                # Detect which category the service belongs to
-                for cat, services in svc.SERVICE_CATALOG.items():
-                    if any(s["name"].lower() == state["servicio"].lower() for s in services):
-                        state["categoria"] = cat
-                        break
-            if service_name:
-                price_msg = svc.get_service_price(service_name)
-                if price_msg:
-                    await svc.send_message(sender_number, price_msg)
-                    return
-            # If no specific service yet, send list of categories
-            await svc.send_message(sender_number, svc.list_services())
-            return
-
         # ── CANCELACIÓN ───────────────────────────────────────
         if intent == "cancelar":
             await svc.clear_state(sender_number)
@@ -266,82 +189,64 @@ async def handle_client_message(
             )
             return
 
-        # ── RECOLECCIÓN / FLUJO DE RESERVA ───────────────────
-        await _handle_booking_flow(sender_number, state, intent, db)
+        # ── INTENCIÓN CLARA DE AGENDAR (Sección 5 y 6) ────────
+        if intent == "agendar":
+            # Si tenemos servicio y fecha, verificamos disponibilidad real en DB
+            if state.get("servicio") and state.get("fecha"):
+                from datetime import date as date_type
+                target_date = svc.parse_fecha(state["fecha"])
+                
+                # Validación de domingos
+                if target_date and target_date.weekday() == 6:
+                    state["fecha"] = None
+                    await svc.save_state(sender_number, state)
+                    reply = await svc.generate_client_reply(
+                        state, message_text,
+                        extra_context="Nota: El salón Glowlab no atiende los domingos. Consulta qué otro día le viene bien."
+                    )
+                    await svc.send_message(sender_number, reply)
+                    return
 
+                if target_date and target_date >= date_type.today():
+                    asesora = state.get("asesora") or svc.detect_advisor(state["servicio"]) or "lizbeth"
+                    state["asesora"] = asesora
+                    available_slots = await svc.get_available_slots(db, asesora, target_date)
+                    fecha_es = svc.format_fecha_es(target_date)
 
-# ─────────────────────────────────────────────────────────────
-# FUNCIONES AUXILIARES DE PASOS
-# ─────────────────────────────────────────────────────────────
+                    if not available_slots:
+                        state["fecha"] = None
+                        await svc.save_state(sender_number, state)
+                        reply = await svc.generate_client_reply(
+                            state, message_text,
+                            extra_context=f"Disponibilidad para {fecha_es}: NO HAY HORARIOS DISPONIBLES. Ofrece revisar otro día amablemente."
+                        )
+                        await svc.send_message(sender_number, reply)
+                        return
 
-async def _handle_booking_flow(
-    sender_number: str,
-    state: Dict[str, Any],
-    intent: str,
-    db: Any,
-) -> None:
-    """Recoge datos de la reserva y avanza el flujo cuando están completos."""
-    state["paso"] = "recolectando"
+                    # Horarios disponibles encontrados
+                    state["slots_disponibles"] = available_slots
+                    state["paso"] = "mostrando_horarios"
+                    await svc.save_state(sender_number, state)
+                    
+                    slots_str = ", ".join([svc.format_hora_12h(s) for s in available_slots])
+                    slots_formatted_list = "\n".join([f"{i}. {svc.format_hora_12h(s)}" for i, s in enumerate(available_slots, 1)])
+                    
+                    reply = await svc.generate_client_reply(
+                        state, message_text,
+                        extra_context=(
+                            f"Disponibilidad confirmada en sistema para el {fecha_es}:\n"
+                            f"{slots_formatted_list}\n"
+                            f"Presenta estos horarios ordenados a la clienta y pregúntale cuál prefiere."
+                        )
+                    )
+                    await svc.send_message(sender_number, reply)
+                    return
 
-    # If we don't yet know the category, ask for it first
-    if not state.get("categoria"):
-        state["paso"] = "esperando_categoria"
+        # ── CONSULTAS, PREGUNTAS, RECOMENDACIONES Y CONVERSACIÓN GENERAL ──
+        # (Secciones 2, 3, 4, 8, 9, 11: Responde a la pregunta antes de intentar reservar)
+        reply = await svc.generate_client_reply(state, message_text)
         await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, svc.list_services())
-        return
-    # If we have a category but still need a specific service
-    if not state.get("servicio"):
-        state["paso"] = "esperando_servicio"
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, svc.prompt_subservice(state["categoria"]))
-        return
-
-    if not state.get("fecha"):
-        await svc.save_state(sender_number, state)
-        await svc.send_message(
-            sender_number,
-            f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
-        )
-        return
-
-    # Tenemos servicio y fecha → consultar disponibilidad
-    from datetime import date as date_type
-    target_date = svc.parse_fecha(state["fecha"])
-    if not target_date or target_date < date_type.today():
-        state["fecha"] = None
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, "¿Qué día prefieres? (ej: viernes, 15/08)")
-        return
-
-    # Sin domingos
-    if target_date.weekday() == 6:
-        state["fecha"] = None
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, "No atendemos los domingos. ¿Qué otro día te viene bien?")
-        return
-
-    asesora = state.get("asesora") or svc.detect_advisor(state["servicio"]) or "lizbeth"
-    state["asesora"] = asesora
-    state["fecha"] = target_date.strftime("%Y-%m-%d")
-
-    available_slots = await svc.get_available_slots(db, asesora, target_date)
-
-    if not available_slots:
-        state["fecha"] = None
-        await svc.save_state(sender_number, state)
-        fecha_es = svc.format_fecha_es(target_date)
-        await svc.send_message(
-            sender_number,
-            f"No hay disponibilidad el *{fecha_es}*. ¿Qué otro día te viene bien?"
-        )
-        return
-
-    state["slots_disponibles"] = available_slots
-    state["paso"] = "mostrando_horarios"
-    await svc.save_state(sender_number, state)
-
-    fecha_es = svc.format_fecha_es(target_date)
-    await svc.send_message(sender_number, svc.build_slots_message(available_slots, fecha_es))
+        await svc.send_message(sender_number, reply)
 
 
 async def _handle_slot_selection(
