@@ -21,6 +21,16 @@ class Cliente(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class Conversacion(Base):
+    """Estado durable de una conversación de WhatsApp, identificado por teléfono."""
+    __tablename__ = "conversaciones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String(32), unique=True, nullable=False, index=True)
+    estado = Column(JSONB, default=dict, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Cita(Base):
     """
     Cita registrada en el sistema.

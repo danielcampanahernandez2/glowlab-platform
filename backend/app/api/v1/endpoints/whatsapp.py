@@ -190,7 +190,33 @@ async def handle_client_message(
             return
 
         # ── INTENCIÓN CLARA DE AGENDAR (Sección 5 y 6) ────────
-        if intent == "agendar":
+        # Informational questions must not discard an in-progress booking.
+        payment_question = any(
+            term in message_text.lower()
+            for term in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "pago para reservar", "adelanto", "separar")
+        )
+        if payment_question and state.get("servicio"):
+            await svc.save_state(sender_number, state)
+            await svc.send_message(sender_number, svc.build_advance_message())
+            return
+
+        # A date-only reply (for example, "el próximo lunes") often has intent
+        # "otro", but it must continue the booking when a service is already known.
+        booking_in_progress = bool(state.get("servicio")) and (
+            intent == "agendar"
+            or paso in ("recolectando_fecha", "mostrando_horarios")
+            or bool(state.get("fecha"))
+        )
+        if booking_in_progress:
+            if state.get("servicio") and not state.get("fecha"):
+                state["paso"] = "recolectando_fecha"
+                await svc.save_state(sender_number, state)
+                await svc.send_message(
+                    sender_number,
+                    f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?",
+                )
+                return
+
             # Si tenemos servicio y fecha, verificamos disponibilidad real en DB
             if state.get("servicio") and state.get("fecha"):
                 from datetime import date as date_type
@@ -450,7 +476,9 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
             if not remote_jid or remote_jid == "status@broadcast" or "@g.us" in remote_jid:
                 continue
 
-            sender_number = remote_jid.split("@")[0]
+            # Evolution can include a device suffix (number:device@...). Keep a
+            # stable, canonical key for the same person's conversation.
+            sender_number = remote_jid.split("@")[0].split(":")[0]
             sender_name = item.get("pushName", "") or ""
 
             message_data: Dict[str, Any] = item.get("message", {}) or {}

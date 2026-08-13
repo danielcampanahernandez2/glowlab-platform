@@ -19,7 +19,8 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.modules.salon.models import Cita, Cliente
+from app.core.database import async_session_factory
+from app.modules.salon.models import Cita, Cliente, Conversacion
 from app.modules.salon.prompts import CLIENT_SYSTEM_PROMPT
 
 logger = logging.getLogger("glowlab.salon.services")
@@ -252,24 +253,48 @@ async def _get_redis():
 
 
 async def load_state(phone: str) -> Dict[str, Any]:
-    """Carga el estado conversacional de una clienta desde Redis."""
+    """Carga estado por teléfono; PostgreSQL es la fuente durable y Redis la caché."""
+    durable_state: Dict[str, Any] = {"paso": "inicial"}
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Conversacion.estado).where(Conversacion.phone == phone))
+            saved = result.scalar_one_or_none()
+            if isinstance(saved, dict):
+                durable_state = saved
+    except Exception as e:
+        logger.warning(f"Error leyendo estado durable ({phone}): {e}")
+
     try:
         r = await _get_redis()
         if r:
             raw = await r.get(f"glowlab:conv:{phone}")
             if raw:
-                return json.loads(raw)
+                cached = json.loads(raw)
+                if cached.get("updated_at", "") >= durable_state.get("updated_at", ""):
+                    return cached
     except Exception as e:
         logger.warning(f"Error leyendo estado Redis ({phone}): {e}")
-    return {"paso": "inicial"}
+    return durable_state
 
 
 async def save_state(phone: str, state: Dict[str, Any]) -> None:
-    """Persiste el estado conversacional en Redis con TTL de 48h."""
+    """Persiste el estado en PostgreSQL y actualiza la caché Redis con TTL de 48h."""
+    state["updated_at"] = datetime.utcnow().isoformat()
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Conversacion).where(Conversacion.phone == phone))
+            conversation = result.scalar_one_or_none()
+            if conversation:
+                conversation.estado = state
+            else:
+                db.add(Conversacion(phone=phone, estado=state))
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"Error guardando estado durable ({phone}): {e}")
+
     try:
         r = await _get_redis()
         if r:
-            state["updated_at"] = datetime.utcnow().isoformat()
             await r.setex(
                 f"glowlab:conv:{phone}",
                 REDIS_STATE_TTL,
@@ -287,6 +312,8 @@ async def clear_state(phone: str) -> None:
             await r.delete(f"glowlab:conv:{phone}")
     except Exception as e:
         logger.warning(f"Error borrando estado Redis ({phone}): {e}")
+
+    await save_state(phone, {"paso": "inicial"})
 
 
 # ============================================================
