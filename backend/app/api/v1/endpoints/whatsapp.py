@@ -200,13 +200,13 @@ async def handle_client_message(
             await svc.send_message(sender_number, svc.build_advance_message())
             return
 
-        # A date-only reply (for example, "el próximo lunes") often has intent
-        # "otro", but it must continue the booking when a service is already known.
-        booking_in_progress = bool(state.get("servicio")) and (
+        # Continuar reserva únicamente si hay intención de agendar o si la clienta responde con una fecha
+        # y NO es una consulta informativa, saludo o cancelación.
+        booking_in_progress = (
             intent == "agendar"
-            or paso in ("recolectando_fecha", "mostrando_horarios")
-            or bool(state.get("fecha"))
-        )
+            or (paso == "recolectando_fecha" and (intent_data.get("fecha") or intent in ("otro", "agendar")))
+        ) and intent not in ("consultar", "saludo", "cancelar", "excepcion")
+
         if booking_in_progress:
             if state.get("servicio") and not state.get("fecha"):
                 state["paso"] = "recolectando_fecha"
