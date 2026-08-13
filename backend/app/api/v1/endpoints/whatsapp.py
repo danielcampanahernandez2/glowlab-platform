@@ -91,7 +91,7 @@ async def handle_staff_message(
 
 
 # ============================================================
-# MANEJADOR: CLIENTAS (CONVERSACIONAL + ATENCIÓN HUMANA)
+# MANEJADOR: CLIENTAS (AGENTE CONVERSACIONAL CON FUNCTION CALLING)
 # ============================================================
 
 async def handle_client_message(
@@ -102,259 +102,38 @@ async def handle_client_message(
     raw_item: Dict[str, Any],
 ) -> None:
     """
-    Atención conversacional de clientas según el System Prompt oficial de Glowlab (25 secciones).
-    Prioriza responder dudas/precios/recomendaciones antes de iniciar reservas.
+    Atención de clientas a través del Agente Conversacional Autónomo de Glowlab (OpenAI Tools).
+    Permite diálogo libre, cambios de tema y ejecución autónoma de reservas y consultas.
     """
-    async with async_session_factory() as db:
-        state = await svc.load_state(sender_number)
-        paso = state.get("paso", "inicial")
+    phone_norm = svc.normalize_phone(sender_number)
+    has_image = "imageMessage" in message_data
 
-        # Guardar nombre si es la primera vez que lo tenemos
-        if sender_name and not state.get("nombre"):
-            state["nombre"] = sender_name
-
-        # ── ESTADO: DERIVADA ──────────────────────────────────
-        if paso == "derivada":
-            await svc.send_message(
-                sender_number,
-                "Tu consulta está siendo atendida por una asesora. Te avisamos pronto. 🌸"
-            )
-            return
-
-        # ── ESTADO: ESPERANDO VOUCHER ─────────────────────────
-        if paso == "esperando_voucher":
+    # Manejo de comprobantes de pago recibidos como imagen
+    if has_image:
+        async with async_session_factory() as db:
+            state = await svc.load_state(phone_norm)
             intent_data = await svc.extract_intent(state, message_text)
             await _handle_voucher_step(
-                sender_number, state, message_text,
+                phone_norm, state, message_text,
                 message_data, raw_item, intent_data, db
             )
             return
 
-        # ── ESTADO: ESPERANDO CONFIRMACIÓN DEL RESUMEN ───────
-        if paso == "esperando_confirmacion":
-            intent_data = await svc.extract_intent(state, message_text)
-            intent = intent_data.get("intent", "otro")
-            await _handle_confirmation_step(sender_number, state, intent, db)
-            return
+    # Procesamiento inteligente con el Agente Conversacional OpenAI
+    reply = await svc.run_conversational_agent(
+        sender_number=phone_norm,
+        sender_name=sender_name,
+        message_text=message_text,
+        message_data=message_data,
+        raw_item=raw_item,
+    )
 
-        # ── ESTADO: MOSTRANDO HORARIOS ────────────────────────
-        if paso == "mostrando_horarios":
-            intent_data = await svc.extract_intent(state, message_text)
-            intent = intent_data.get("intent", "otro")
-            # Si el usuario hace una pregunta o cambia de tema en vez de elegir horario
-            if intent not in ("consultar", "cancelar", "excepcion") and (intent_data.get("slot_num") or intent_data.get("hora") or intent in ("confirmar", "rechazar")):
-                await _handle_slot_selection(sender_number, state, intent_data)
-                return
+    if reply:
+        await svc.send_message(phone_norm, reply)
 
-        # ── ESTADO: CITA CONFIRMADA (reinicio para nueva consulta) ─
-        if paso == "cita_confirmada":
-            state = {"paso": "inicial", "nombre": state.get("nombre") or sender_name}
-
-        # ── EXTRACCIÓN DE INTENCIÓN Y ENTIDADES ───────────────
-        intent_data = await svc.extract_intent(state, message_text)
-        intent = intent_data.get("intent", "otro")
-
-        # Actualizar servicio si fue mencionado
-        if intent_data.get("servicio"):
-            state["servicio"] = intent_data["servicio"]
-            state["asesora"] = svc.detect_advisor(intent_data["servicio"])
-
-        # Actualizar fecha si fue mencionada
-        if intent_data.get("fecha"):
-            from datetime import date
-            parsed = svc.parse_fecha(intent_data["fecha"])
-            if parsed and parsed >= date.today():
-                state["fecha"] = parsed.strftime("%Y-%m-%d")
-
-        # ── EXCEPCIÓN EXPLÍCITA ───────────────────────────────
-        if intent_data.get("requiere_excepcion") or intent == "excepcion":
-            state["paso"] = "derivada"
-            await svc.save_state(sender_number, state)
-            await svc.notify_all_staff(
-                f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
-                f"necesita atención especial:\n\"{message_text}\""
-            )
-            await svc.send_message(
-                sender_number,
-                "Entiendo. Voy a consultar con una asesora y te avisamos enseguida. 🌸"
-            )
-            return
-
-        # ── CANCELACIÓN ───────────────────────────────────────
-        if intent == "cancelar":
-            await svc.clear_state(sender_number)
-            await svc.send_message(
-                sender_number,
-                "Entendido, tu solicitud ha sido cancelada. Si necesitas algo más, escríbenos. 🌸"
-            )
-            return
-
-        # ── CONSULTA DE PAGO / ADELANTO EN PROCESO DE RESERVA ──
-        payment_question = any(
-            term in message_text.lower()
-            for term in ("cuánto pagar", "cuanto pagar", "cuánto debo pagar", "cuanto debo pagar", "pago para reservar", "adelanto", "separar")
-        )
-        if payment_question and (state.get("servicio") or paso in ("recolectando_fecha", "mostrando_horarios", "esperando_confirmacion")):
-            await svc.save_state(sender_number, state)
-            await svc.send_message(sender_number, svc.build_advance_message())
-            return
-
-        # Continuar reserva únicamente si hay intención de agendar o si la clienta responde con una fecha
-        # y NO es una consulta informativa, saludo o cancelación.
-        booking_in_progress = (
-            intent == "agendar"
-            or (paso in ("recolectando_fecha", "mostrando_horarios") and (intent_data.get("fecha") or intent in ("otro", "agendar")))
-        ) and intent not in ("consultar", "saludo", "cancelar", "excepcion")
-
-        if booking_in_progress:
-            if state.get("servicio") and not state.get("fecha"):
-                state["paso"] = "recolectando_fecha"
-                await svc.save_state(sender_number, state)
-                await svc.send_message(
-                    sender_number,
-                    f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?",
-                )
-                return
-
-            # Si tenemos servicio y fecha, verificamos disponibilidad real en DB
-            if state.get("servicio") and state.get("fecha"):
-                from datetime import date as date_type
-                target_date = svc.parse_fecha(state["fecha"])
-                
-                # Validación de domingos
-                if target_date and target_date.weekday() == 6:
-                    state["fecha"] = None
-                    await svc.save_state(sender_number, state)
-                    reply = await svc.generate_client_reply(
-                        state, message_text,
-                        extra_context="Nota: El salón Glowlab no atiende los domingos. Consulta qué otro día le viene bien."
-                    )
-                    await svc.send_message(sender_number, reply)
-                    return
-
-                if target_date and target_date >= date_type.today():
-                    asesora = state.get("asesora") or svc.detect_advisor(state["servicio"]) or "lizbeth"
-                    state["asesora"] = asesora
-                    available_slots = await svc.get_available_slots(db, asesora, target_date)
-                    fecha_es = svc.format_fecha_es(target_date)
-
-                    if not available_slots:
-                        state["fecha"] = None
-                        await svc.save_state(sender_number, state)
-                        reply = await svc.generate_client_reply(
-                            state, message_text,
-                            extra_context=f"Disponibilidad para {fecha_es}: NO HAY HORARIOS DISPONIBLES. Ofrece revisar otro día amablemente."
-                        )
-                        await svc.send_message(sender_number, reply)
-                        return
-
-                    # Horarios disponibles encontrados
-                    state["slots_disponibles"] = available_slots
-                    state["paso"] = "mostrando_horarios"
-                    await svc.save_state(sender_number, state)
-                    
-                    slots_str = ", ".join([svc.format_hora_12h(s) for s in available_slots])
-                    slots_formatted_list = "\n".join([f"{i}. {svc.format_hora_12h(s)}" for i, s in enumerate(available_slots, 1)])
-                    
-                    reply = await svc.generate_client_reply(
-                        state, message_text,
-                        extra_context=(
-                            f"Disponibilidad confirmada en sistema para el {fecha_es}:\n"
-                            f"{slots_formatted_list}\n"
-                            f"Presenta estos horarios ordenados a la clienta y pregúntale cuál prefiere."
-                        )
-                    )
-                    await svc.send_message(sender_number, reply)
-                    return
-
-        # ── CONSULTAS, PREGUNTAS, RECOMENDACIONES Y CONVERSACIÓN GENERAL ──
-        # (Secciones 2, 3, 4, 8, 9, 11: Responde a la pregunta antes de intentar reservar)
-        reply = await svc.generate_client_reply(state, message_text)
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, reply)
-
-
-async def _handle_slot_selection(
-    sender_number: str,
-    state: Dict[str, Any],
-    intent_data: Dict[str, Any],
-) -> None:
-    """Procesa la selección de horario y avanza al resumen de confirmación."""
-    available_slots: List[str] = state.get("slots_disponibles", [])
-    slot_num = intent_data.get("slot_num")
-
-    # Selección por número
-    if slot_num and isinstance(slot_num, int) and 1 <= slot_num <= len(available_slots):
-        state["hora"] = available_slots[slot_num - 1]
-        state["paso"] = "esperando_confirmacion"
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, svc.build_summary_message(state))
-        return
-
-    # Selección por hora explícita
-    hora_raw = intent_data.get("hora", "")
-    if hora_raw:
-        try:
-            h_str = hora_raw.lower().replace("am", "").replace("pm", "").strip().split(":")[0]
-            h = int(h_str)
-            if "pm" in hora_raw.lower() and h < 12:
-                h += 12
-            hora_norm = f"{h:02d}:00"
-            if hora_norm in available_slots:
-                state["hora"] = hora_norm
-                state["paso"] = "esperando_confirmacion"
-                await svc.save_state(sender_number, state)
-                await svc.send_message(sender_number, svc.build_summary_message(state))
-                return
-        except (ValueError, IndexError):
-            pass
-
-    # Volver a mostrar las opciones
-    try:
-        from datetime import datetime
-        d = datetime.strptime(state["fecha"], "%Y-%m-%d").date()
-        fecha_es = svc.format_fecha_es(d)
-    except Exception:
-        fecha_es = state.get("fecha", "")
-
-    await svc.send_message(sender_number, svc.build_slots_message(available_slots, fecha_es))
-
-
-async def _handle_confirmation_step(
-    sender_number: str,
-    state: Dict[str, Any],
-    intent: str,
-    db: Any,
-) -> None:
-    """Gestiona la confirmación o rechazo del resumen de cita."""
-    if intent == "confirmar":
-        asesora = state.get("asesora") or svc.detect_advisor(state.get("servicio", "")) or "lizbeth"
-        cita = await svc.create_cita(
-            db=db,
-            cliente_phone=sender_number,
-            cliente_nombre=state.get("nombre", ""),
-            servicio=state["servicio"],
-            asesora=asesora,
-            fecha=state["fecha"],
-            hora=state["hora"],
-        )
-        state["cita_id"] = cita.id
-        state["asesora"] = asesora
-        state["paso"] = "esperando_voucher"
-        state["intentos_voucher"] = 0
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, svc.build_advance_message())
-
-    elif intent == "rechazar":
-        state["hora"] = None
-        state["fecha"] = None
-        state["paso"] = "recolectando"
-        await svc.save_state(sender_number, state)
-        await svc.send_message(sender_number, "Sin problema. ¿Qué día y horario prefieres?")
-
-    else:
-        await svc.send_message(sender_number, "¿Confirmamos la cita? Responde *Sí* o *No*.")
-
+# ============================================================
+# GESTIÓN DE COMPROBANTES DE PAGO (VOUCHERS)
+# ============================================================
 
 async def _handle_voucher_step(
     sender_number: str,

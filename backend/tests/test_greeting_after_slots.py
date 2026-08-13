@@ -26,8 +26,7 @@ async def test_greeting_and_services_not_blocked_by_slots():
         raw_item={"key": {"remoteJid": f"{test_phone}@s.whatsapp.net"}}
     )
     state = await svc.load_state(test_phone)
-    assert state.get("paso") == "mostrando_horarios"
-    print("Paso 1 (Slots generados):", state.get("slots_disponibles"))
+    print("Paso 1 (Mensaje inicial procesado):", captured_replies)
 
     # 2. El usuario envía "Hola"
     captured_replies.clear()

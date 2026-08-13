@@ -614,80 +614,371 @@ def _record_history(state: Dict[str, Any], user_msg: str, assistant_msg: str) ->
 
 
 # ============================================================
-# EXTRACCIÓN DE INTENCIÓN (OPENAI + HEURÍSTICA CONTEXTUAL)
+# DEFINICIÓN DE HERRAMIENTAS AUTÓNOMAS (OPENAI FUNCTION CALLING)
+# ============================================================
+
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_services",
+            "description": "Obtiene la lista oficial de servicios, tratamientos y precios de Glowlab (pestañas, uñas, tratamientos capilares).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["pestanas", "unas", "capilar", "todos"],
+                        "description": "Categoría opcional para filtrar los servicios disponibles."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_available_slots",
+            "description": "Consulta en tiempo real en la base de datos de Glowlab los horarios libres y disponibles para una fecha y servicio.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Fecha a consultar en formato YYYY-MM-DD o lenguaje natural ('mañana', 'lunes', 'sábado', '2026-08-17')."
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Servicio de interés (ej. 'pestañas', 'uñas', 'botox capilar', 'keratina', 'hidratación')."
+                    }
+                },
+                "required": ["date"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_reservation",
+            "description": "Registra una nueva reserva de cita en el sistema una vez que la clienta acordó y confirmó el servicio, fecha y hora.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": "Nombre del servicio a reservar."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Fecha de la cita en formato YYYY-MM-DD o fecha natural."
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Hora seleccionada en formato 24h (ej. '10:00', '14:00', '16:00') o 12h ('10 am', '4 pm')."
+                    },
+                    "client_name": {
+                        "type": "string",
+                        "description": "Nombre de la clienta si lo mencionó."
+                    }
+                },
+                "required": ["service", "date", "time"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_or_reset_reservation",
+            "description": "Cancela la reserva en curso o reinicia el proceso de agendamiento si la clienta indica que ya no desea agendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Motivo de la cancelación si fue expresado por la clienta."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_to_human",
+            "description": "Deriva la conversación a una asesora humana del salón cuando el caso requiere atención especial o excepciones.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "issue": {
+                        "type": "string",
+                        "description": "Detalle del motivo de la derivación al staff humano."
+                    }
+                },
+                "required": ["issue"]
+            }
+        }
+    }
+]
+
+
+async def execute_tool_call(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    phone: str,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ejecuta de manera asíncrona las herramientas invocadas por el Agente de OpenAI."""
+    phone_norm = normalize_phone(phone)
+
+    if tool_name == "get_services":
+        cat = arguments.get("category", "todos")
+        if cat in ("pestanas", "unas", "capilar") and cat in ("pestanas", "unas", "capilar"):
+            cat_map = {"pestanas": "Pestañas", "unas": "Uñas", "capilar": "Tratamientos capilares"}
+            cat_name = cat_map.get(cat, "Tratamientos capilares")
+            services = SERVICE_CATALOG.get(cat_name, [])
+            return {"category": cat_name, "services": services}
+        return {"catalog": SERVICE_CATALOG}
+
+    elif tool_name == "get_available_slots":
+        raw_date = arguments.get("date", "")
+        service = arguments.get("service") or state.get("servicio", "")
+        target_date = parse_fecha(raw_date)
+
+        if not target_date:
+            return {
+                "status": "error",
+                "message": f"No se pudo determinar la fecha para '{raw_date}'. Solicita a la clienta que indique el día deseado."
+            }
+
+        # Validación de domingos
+        if target_date.weekday() == 6:
+            return {
+                "status": "closed",
+                "date": target_date.strftime("%Y-%m-%d"),
+                "date_formatted": format_fecha_es(target_date),
+                "message": "El salón Glowlab permanece cerrado los domingos. Atendemos de lunes a sábado de 10:00 a 18:00."
+            }
+
+        if target_date < date.today():
+            return {
+                "status": "invalid_date",
+                "message": "La fecha solicitada es anterior a hoy. Solicita una fecha actual o futura."
+            }
+
+        advisor = detect_advisor(service) or state.get("asesora") or "lizbeth"
+        state["asesora"] = advisor
+        state["fecha"] = target_date.strftime("%Y-%m-%d")
+        if service:
+            state["servicio"] = service
+
+        async with async_session_factory() as db:
+            slots = await get_available_slots(db, advisor, target_date)
+
+        state["slots_disponibles"] = slots
+        fecha_es = format_fecha_es(target_date)
+
+        return {
+            "status": "available" if slots else "no_slots",
+            "date": target_date.strftime("%Y-%m-%d"),
+            "date_formatted": fecha_es,
+            "service": service,
+            "slots": slots,
+            "slots_formatted": [format_hora_12h(s) for s in slots],
+            "message": (
+                f"Horarios disponibles para el {fecha_es}: {', '.join([format_hora_12h(s) for s in slots])}"
+                if slots else f"No hay horarios libres para el {fecha_es}."
+            )
+        }
+
+    elif tool_name == "create_reservation":
+        service = arguments.get("service") or state.get("servicio", "Servicio general")
+        raw_date = arguments.get("date", "")
+        raw_time = arguments.get("time", "")
+        client_name = arguments.get("client_name") or state.get("nombre", "")
+
+        target_date = parse_fecha(raw_date) or parse_fecha(state.get("fecha", "")) or date.today()
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        # Normalizar hora (ej. '10am' -> '10:00', '3pm' -> '15:00')
+        hora_norm = raw_time
+        try:
+            h_clean = raw_time.lower().replace("am", "").replace("pm", "").strip().split(":")[0]
+            h_int = int(h_clean)
+            if "pm" in raw_time.lower() and h_int < 12:
+                h_int += 12
+            hora_norm = f"{h_int:02d}:00"
+        except Exception:
+            pass
+
+        advisor = detect_advisor(service) or state.get("asesora") or "lizbeth"
+
+        async with async_session_factory() as db:
+            cita = await create_cita(
+                db=db,
+                cliente_phone=phone_norm,
+                cliente_nombre=client_name,
+                servicio=service,
+                asesora=advisor,
+                fecha=date_str,
+                hora=hora_norm,
+            )
+
+        state["cita_id"] = cita.id
+        state["servicio"] = service
+        state["fecha"] = date_str
+        state["hora"] = hora_norm
+        state["paso"] = "esperando_voucher"
+
+        return {
+            "status": "success",
+            "reservation_id": cita.id,
+            "service": service,
+            "date": date_str,
+            "date_formatted": format_fecha_es(target_date),
+            "time": format_hora_12h(hora_norm),
+            "client_name": client_name,
+            "advance_amount": settings.ADVANCE_AMOUNT,
+            "payment_info": settings.PAYMENT_INFO,
+            "instruction": "Informa a la clienta que su cita ha sido pre-registrada con éxito. Explícale que para confirmarla debe abonar el adelanto de S/ 20 por Yape/Plin y enviar la foto del comprobante aquí."
+        }
+
+    elif tool_name == "cancel_or_reset_reservation":
+        state["servicio"] = None
+        state["fecha"] = None
+        state["hora"] = None
+        state["slots_disponibles"] = None
+        state["paso"] = "inicial"
+        return {"status": "cancelled", "message": "Proceso cancelado. Responde con amabilidad que no hay inconveniente."}
+
+    elif tool_name == "escalate_to_human":
+        issue = arguments.get("issue", "Solicitud especial de clienta")
+        state["paso"] = "derivada"
+        await notify_all_staff(f"⚠️ Atención especial requerida para +{phone_norm} ({state.get('nombre', '')}):\n\"{issue}\"")
+        return {"status": "escalated", "message": "Notificación enviada al equipo de Glowlab. Indica a la clienta que una asesora se comunicará con ella en breve."}
+
+    return {"status": "error", "message": f"Herramienta '{tool_name}' no reconocida."}
+
+
+# ============================================================
+# AGENTE CONVERSACIONAL ABIERTO (OPENAI AGENT RUNNER)
+# ============================================================
+
+async def run_conversational_agent(
+    sender_number: str,
+    sender_name: str,
+    message_text: str,
+    message_data: Optional[Dict[str, Any]] = None,
+    raw_item: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Agente Conversacional Autónomo basado en OpenAI con Function Calling (Tools).
+    Maneja el diálogo, ejecuta herramientas en la base de datos y mantiene la memoria fluida.
+    """
+    phone_norm = normalize_phone(sender_number)
+    state = await load_state(phone_norm)
+    if sender_name and not state.get("nombre"):
+        state["nombre"] = sender_name
+
+    today = date.today()
+    today_formatted = format_fecha_es(today)
+
+    system_content = f"{CLIENT_SYSTEM_PROMPT}\n\n"
+    system_content += "--- INFORMACIÓN DEL SISTEMA EN TIEMPO REAL ---\n"
+    system_content += f"• Fecha actual: {today_formatted} ({today.strftime('%Y-%m-%d')})\n"
+    system_content += f"• Clienta: {state.get('nombre') or sender_name or 'Clienta'}\n"
+    system_content += f"• WhatsApp: +{phone_norm}\n"
+    if state.get("servicio"):
+        system_content += f"• Servicio en curso: {state['servicio']}\n"
+    if state.get("fecha"):
+        system_content += f"• Fecha en curso: {state['fecha']}\n"
+    if state.get("hora"):
+        system_content += f"• Hora en curso: {state['hora']}\n"
+
+    history: List[Dict[str, Any]] = state.get("history", [])
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
+    for msg in history[-12:]:
+        if isinstance(msg, dict) and msg.get("role"):
+            clean_msg: Dict[str, Any] = {"role": msg["role"]}
+            if "content" in msg:
+                clean_msg["content"] = msg["content"]
+            if "tool_calls" in msg:
+                clean_msg["tool_calls"] = msg["tool_calls"]
+            if "tool_call_id" in msg:
+                clean_msg["tool_call_id"] = msg["tool_call_id"]
+            messages.append(clean_msg)
+
+    messages.append({"role": "user", "content": message_text})
+
+    final_reply = ""
+    if settings.OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                for _ in range(5):  # Máximo 5 rondas de herramientas
+                    payload = {
+                        "model": settings.OPENAI_MODEL,
+                        "messages": messages,
+                        "tools": OPENAI_TOOLS,
+                        "tool_choice": "auto",
+                        "temperature": 0.4,
+                        "max_tokens": 500,
+                    }
+                    res = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
+                    if res.status_code != 200:
+                        logger.warning(f"OpenAI error {res.status_code}: {res.text[:150]}")
+                        break
+
+                    res_json = res.json()
+                    choice = res_json["choices"][0]
+                    assistant_msg = choice["message"]
+
+                    if assistant_msg.get("tool_calls"):
+                        messages.append(assistant_msg)
+                        for tool_call in assistant_msg["tool_calls"]:
+                            fn = tool_call["function"]
+                            fn_name = fn["name"]
+                            try:
+                                fn_args = json.loads(fn.get("arguments", "{}"))
+                            except Exception:
+                                fn_args = {}
+                            tool_result = await execute_tool_call(fn_name, fn_args, phone_norm, state)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call["id"],
+                                "content": json.dumps(tool_result, ensure_ascii=False),
+                            })
+                    else:
+                        final_reply = (assistant_msg.get("content") or "").strip()
+                        break
+        except Exception as e:
+            logger.error(f"Error en OpenAI Agent Runner: {e}")
+
+    if not final_reply:
+        final_reply = _fallback_client_reply(state, message_text)
+
+    _record_history(state, message_text, final_reply)
+    await save_state(phone_norm, state)
+    return final_reply
+
+
+# ============================================================
+# COMPATIBILIDAD CON EXTRACT_INTENT Y GENERATE_CLIENT_REPLY
 # ============================================================
 
 async def extract_intent(state: Dict[str, Any], message: str) -> Dict[str, Any]:
-    """
-    Usa OpenAI para extraer intención y entidades del mensaje de la clienta,
-    respetando la jerarquía de intenciones del System Prompt (Secciones 2, 3 y 5)
-    e inyectando el historial conversacional previo.
-    """
-    ctx = f"Estado actual: {state.get('paso', 'inicial')}"
-    if state.get("servicio"):
-        ctx += f" | Servicio en curso: {state['servicio']}"
-    if state.get("fecha"):
-        ctx += f" | Fecha en curso: {state['fecha']}"
-
-    system = (
-        "Eres un analizador de intenciones de WhatsApp para el salón de belleza Glowlab.\n"
-        "Reglas para clasificar 'intent':\n"
-        "- 'consultar': si la clienta pregunta precios, qué incluye un servicio, pide recomendación, tiene dudas o compara servicios.\n"
-        "- 'agendar': si la clienta manifiesta intención de reservar, consultar disponibilidad, o si responde con un día/fecha a la pregunta del bot sobre qué día prefiere.\n"
-        "- 'saludo': si solo saluda sin hacer una pregunta específica ni pedir servicio.\n"
-        "- 'confirmar': si confirma datos o cita ('sí', 'confirmo', 'de acuerdo', 'está bien', 'dale').\n"
-        "- 'rechazar': si cancela o rechaza opción ('no', 'cambiar', 'otro').\n"
-        "- 'cancelar': si pide anular todo el proceso.\n"
-        "- 'excepcion': si pide no pagar adelanto o solicita caso especial.\n"
-        "- 'otro': conversación general.\n\n"
-        "Responde ÚNICAMENTE con JSON válido con estas claves:\n"
-        "{\n"
-        "  \"intent\": \"consultar\" | \"agendar\" | \"saludo\" | \"confirmar\" | \"rechazar\" | \"cancelar\" | \"excepcion\" | \"otro\",\n"
-        "  \"servicio\": string o null (ej: 'pestañas', 'botox capilar', 'keratina', 'uñas'),\n"
-        "  \"fecha\": string o null (ej: 'sábado', 'lunes', 'mañana', '15/08', 'YYYY-MM-DD'),\n"
-        "  \"hora\": string o null (ej: 'mañana', 'tarde', '10am', '3pm', '16:00'),\n"
-        "  \"slot_num\": entero o null (si elige opción numerada como 1, 2),\n"
-        "  \"requiere_excepcion\": boolean\n"
-        "}"
-    )
-
-    if settings.OPENAI_API_KEY:
-        messages = [{"role": "system", "content": system}]
-        history = state.get("history", [])
-        for msg in history[-4:]:
-            if isinstance(msg, dict) and msg.get("role") in ("user", "assistant") and msg.get("content"):
-                messages.append({"role": msg["role"], "content": msg["content"]})
-        messages.append({"role": "user", "content": f"Contexto: {ctx}\nMensaje: {message}"})
-
-        payload = {
-            "model": settings.OPENAI_MODEL,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 250,
-            "response_format": {"type": "json_object"},
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                if res.status_code == 200:
-                    data = res.json()["choices"][0]["message"]["content"]
-                    return json.loads(data)
-        except Exception as e:
-            logger.warning(f"Error extrayendo intención con OpenAI: {e}")
-
+    """Helper de compatibilidad."""
     return _keyword_extract(message, state)
 
 
 def _keyword_extract(message: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Extracción de intención por palabras clave contextual (fallback sin IA)."""
+    """Extracción de intención por palabras clave contextual (fallback y compatibilidad)."""
     s = message.lower()
     state = state or {}
     paso = state.get("paso", "inicial")
@@ -699,13 +990,11 @@ def _keyword_extract(message: str, state: Optional[Dict[str, Any]] = None) -> Di
             fecha = fkw
             break
 
-    # Prioridad: consultas informativas primero (Regla 2 y 3)
     if any(k in s for k in ("precio", "costo", "cuánto", "cuanto", "vale", "cobran", "información", "informacion", "qué incluye", "que incluye", "recomiendas", "recomendación", "seco", "dañado", "frizz", "diferencia", "servicios", "catálogo", "catalogo")):
         intent = "consultar"
     elif any(k in s for k in ("cita", "agendar", "reservar", "turno", "separar", "disponibilidad", "horarios", "quiero reservar", "sacar cita")):
         intent = "agendar"
     elif fecha and (paso in ("recolectando_fecha", "mostrando_horarios") or state.get("servicio")):
-        # Si el usuario responde con un día durante el flujo de reserva, la intención es agendar
         intent = "agendar"
     elif any(k in s for k in ("cancelar", "anular", "cancel")):
         intent = "cancelar"
@@ -720,14 +1009,12 @@ def _keyword_extract(message: str, state: Optional[Dict[str, Any]] = None) -> Di
     else:
         intent = "otro"
 
-    # Número de slot seleccionado
     slot_num = None
     for i in range(1, 10):
         if f" {i} " in f" {s} " or s.strip() == str(i):
             slot_num = i
             break
 
-    # Servicio mencionado (ordenar por longitud descendente para encontrar el más específico)
     servicio = None
     for kw in sorted(SERVICE_TO_ADVISOR.keys(), key=len, reverse=True):
         if kw in s:
