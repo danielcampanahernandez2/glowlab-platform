@@ -19,6 +19,33 @@ from app.modules.salon import models as _salon_models  # noqa: F401
 setup_logging()
 logger = logging.getLogger("glowlab.main")
 
+
+# ──────────────────────────────────────────────────────────────
+# INICIALIZACIÓN DE OBSERVABILIDAD (SENTRY)
+# ──────────────────────────────────────────────────────────────
+
+def _init_sentry() -> None:
+    """Inicializa Sentry SDK si SENTRY_DSN está definido."""
+    if settings.SENTRY_DSN:
+        try:
+            import sentry_sdk
+            sentry_sdk.init(
+                dsn=settings.SENTRY_DSN,
+                environment=settings.SENTRY_ENVIRONMENT or settings.ENVIRONMENT,
+                traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+                release=f"{settings.PROJECT_NAME}@{settings.VERSION}",
+                send_default_pii=False,
+            )
+            logger.info(f"✅ Sentry SDK inicializado (env=[{settings.SENTRY_ENVIRONMENT or settings.ENVIRONMENT}]).")
+        except Exception as e:
+            logger.warning(f"No se pudo inicializar Sentry SDK: {e}")
+    else:
+        logger.info("Sentry DSN no configurado; observabilidad de Sentry desactivada.")
+
+
+_init_sentry()
+
+
 # ──────────────────────────────────────────────────────────────
 # SCHEDULER DE RECORDATORIOS
 # ──────────────────────────────────────────────────────────────

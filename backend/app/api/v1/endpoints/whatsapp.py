@@ -29,65 +29,21 @@ router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 async def handle_staff_message(
     staff_phone: str, staff_name: str, message_text: str
 ) -> None:
-    """Procesa mensajes enviados por las asesoras del equipo."""
-    logger.info(f"[STAFF] {staff_name} ({staff_phone}): {message_text}")
+    """
+    Procesa comandos enviados por las asesoras del equipo (Lizbeth / Anali)
+    de forma 100% determinista (sin LLM) para garantizar velocidad y precisión.
+    """
+    logger.info(f"[STAFF COMANDO] {staff_name} ({staff_phone}): {message_text}")
+    phone_norm = svc.normalize_phone(staff_phone)
 
-    # Intentar respuesta con OpenAI
-    if settings.OPENAI_API_KEY:
-        try:
-            import httpx
-            payload = {
-                "model": settings.OPENAI_MODEL,
-                "messages": [
-                    {"role": "system", "content": STAFF_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Especialista: {staff_name}\nMensaje: {message_text}"},
-                ],
-                "temperature": 0.4,
-                "max_tokens": 300,
-            }
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                res = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                if res.status_code == 200:
-                    reply = res.json()["choices"][0]["message"]["content"].strip()
-                    await svc.send_message(staff_phone, reply)
-                    return
-        except Exception as e:
-            logger.warning(f"Error OpenAI staff: {e}")
-
-    # Respuesta de respaldo por palabras clave
-    text_low = message_text.lower()
-    if any(k in text_low for k in ("horario", "semana", "lunes", "martes", "miercoles",
-                                    "jueves", "viernes", "sabado", "disponible",
-                                    "bloquea", "descanso", "libre", "trabajar")):
-        reply = (
-            f"✅ *Horario actualizado — Glowlab*\n\n"
-            f"Hola *{staff_name}*, registré tu disponibilidad:\n"
-            f"📝 _{message_text}_\n\n"
-            f"La agenda quedará configurada para que solo se reserve en tus horarios activos."
+    async with svc.phone_distributed_lock(phone_norm):
+        reply = await svc.execute_staff_command(
+            staff_phone=phone_norm,
+            staff_name=staff_name,
+            message=message_text,
         )
-    elif any(k in text_low for k in ("cita", "agenda", "reserva")):
-        reply = (
-            f"📋 *Agenda — Glowlab*\n\n"
-            f"Hola *{staff_name}*, cada cita nueva que llegue te la notificaré "
-            f"aquí con todos los datos en tiempo real."
-        )
-    else:
-        reply = (
-            f"Hola *{staff_name}* 👋\n\n"
-            f"• Para actualizar tu horario escribe, por ejemplo:\n"
-            f"  _'Esta semana trabajo de lunes a viernes de 10am a 6pm'_\n"
-            f"• Para bloquear un día: _'Mañana no atiendo'_\n"
-            f"• Las nuevas citas te llegarán automáticamente aquí."
-        )
-
-    await svc.send_message(staff_phone, reply)
+        if reply:
+            await svc.send_message(phone_norm, reply)
 
 
 # ============================================================
@@ -104,32 +60,37 @@ async def handle_client_message(
     """
     Atención de clientas a través del Agente Conversacional Autónomo de Glowlab (OpenAI Tools).
     Permite diálogo libre, cambios de tema y ejecución autónoma de reservas y consultas.
+    Utiliza lock distribuido por teléfono para garantizar procesamiento serializado y libre de condiciones de carrera.
     """
     phone_norm = svc.normalize_phone(sender_number)
     has_image = "imageMessage" in message_data
 
-    # Manejo de comprobantes de pago recibidos como imagen
-    if has_image:
-        async with async_session_factory() as db:
-            state = await svc.load_state(phone_norm)
-            intent_data = await svc.extract_intent(state, message_text)
-            await _handle_voucher_step(
-                phone_norm, state, message_text,
-                message_data, raw_item, intent_data, db
+    # Indicador visual de presencia 'escribiendo...' (composing) en WhatsApp
+    # Se activa de inmediato (mientras espera en el lock o procesa con OpenAI)
+    async with svc.typing_indicator(phone_norm):
+        async with svc.phone_distributed_lock(phone_norm):
+            # Manejo de comprobantes de pago recibidos como imagen
+            if has_image:
+                async with async_session_factory() as db:
+                    state = await svc.load_state(phone_norm)
+                    intent_data = await svc.extract_intent(state, message_text)
+                    await _handle_voucher_step(
+                        phone_norm, state, message_text,
+                        message_data, raw_item, intent_data, db
+                    )
+                    return
+
+            # Procesamiento inteligente con el Agente Conversacional OpenAI
+            reply = await svc.run_conversational_agent(
+                sender_number=phone_norm,
+                sender_name=sender_name,
+                message_text=message_text,
+                message_data=message_data,
+                raw_item=raw_item,
             )
-            return
 
-    # Procesamiento inteligente con el Agente Conversacional OpenAI
-    reply = await svc.run_conversational_agent(
-        sender_number=phone_norm,
-        sender_name=sender_name,
-        message_text=message_text,
-        message_data=message_data,
-        raw_item=raw_item,
-    )
-
-    if reply:
-        await svc.send_message(phone_norm, reply)
+            if reply:
+                await svc.send_message(phone_norm, reply)
 
 # ============================================================
 # GESTIÓN DE COMPROBANTES DE PAGO (VOUCHERS)
@@ -289,6 +250,53 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
 
     except Exception as e:
         logger.error(f"Error procesando payload del webhook: {e}", exc_info=True)
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
+
+
+import secrets
+from fastapi.responses import JSONResponse
+
+
+# ============================================================
+# VERIFICACIÓN DE SEGURIDAD DEL WEBHOOK
+# ============================================================
+
+def _verify_webhook_auth(request: Request) -> bool:
+    """
+    Valida la autenticidad del webhook entrante comparando headers o query params
+    contra EVOLUTION_WEBHOOK_SECRET (o EVOLUTION_API_KEY por compatibilidad).
+    Utiliza secrets.compare_digest para mitigar ataques de temporización (timing attacks).
+    """
+    expected_secret = settings.EVOLUTION_WEBHOOK_SECRET or settings.EVOLUTION_API_KEY
+    if not expected_secret:
+        # En caso de que no haya secreto configurado (modo dev abierto), se permite
+        return True
+
+    # 1. Headers estándar de autenticación en Evolution API
+    auth_header = (
+        request.headers.get("apikey")
+        or request.headers.get("x-api-key")
+        or request.headers.get("x-webhook-secret")
+    )
+
+    # 2. Header Authorization: Bearer <secret>
+    if not auth_header:
+        bearer = request.headers.get("authorization", "")
+        if bearer.lower().startswith("bearer "):
+            auth_header = bearer[7:].strip()
+
+    # 3. Query params de respaldo (?token=... o ?apikey=...)
+    if not auth_header:
+        auth_header = request.query_params.get("token") or request.query_params.get("apikey")
+
+    if not auth_header:
+        return False
+
+    return secrets.compare_digest(auth_header, expected_secret)
 
 
 # ============================================================
@@ -309,15 +317,34 @@ async def verify_webhook():
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Endpoint receptor universal de eventos enviados por Evolution API.
-    Responde 200 de inmediato y procesa el mensaje en segundo plano.
+    Verifica la autenticidad del secreto, responde 200 de inmediato y procesa en segundo plano.
     """
+    if not _verify_webhook_auth(request):
+        client_ip = request.client.host if request.client else "unknown"
+        logger.warning(f"⛔ [UNAUTHORIZED] Intento de acceso no autenticado al webhook desde IP: {client_ip}")
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                scope.set_tag("security_event", "unauthorized_webhook_attempt")
+                scope.set_context("client_info", {"ip": client_ip})
+                sentry_sdk.capture_message(
+                    f"Intento de acceso no autorizado a /webhook desde {client_ip}",
+                    level="warning",
+                )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Unauthorized: Invalid or missing webhook authentication secret"},
+        )
+
     try:
         payload = await request.json()
     except Exception:
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content="Invalid JSON")
 
     event = str(payload.get("event", "")).lower()
-    logger.info(f"Webhook recibido: [{event}] instancia=[{payload.get('instance')}]")
+    logger.info(f"Webhook recibido y autenticado: [{event}] instancia=[{payload.get('instance')}]")
 
     background_tasks.add_task(process_webhook_payload, payload)
 

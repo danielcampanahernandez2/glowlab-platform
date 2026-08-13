@@ -28,6 +28,10 @@ pytest-cov>=5.0.0,<6.0.0
 # AI & LLM
 openai>=1.30.0,<2.0.0
 
+# Observability & Monitoring
+sentry-sdk[fastapi]>=2.0.0,<3.0.0
+
 # Scheduler (recordatorios automáticos)
 apscheduler>=3.10.0,<4.0.0
+
 

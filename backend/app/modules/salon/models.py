@@ -76,3 +76,21 @@ class Cita(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OpenAIUsageLog(Base):
+    """
+    Registro detallado de consumo de tokens y costo estimado por llamada a la API de OpenAI.
+    Permite monitoreo de costes y alertas de presupuesto mensual.
+    """
+    __tablename__ = "openai_usage_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_masked = Column(String(30), index=True)
+    model = Column(String(50), default="gpt-4o-mini")
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    cost_usd = Column(Numeric(10, 6), default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+

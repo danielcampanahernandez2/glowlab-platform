@@ -88,10 +88,12 @@ class Settings(BaseSettings):
     EVOLUTION_API_URL: str = "https://evolution-api-production-2fb7.up.railway.app"
     EVOLUTION_API_KEY: str = "2663309dc1bc96fa057fc5630ac4de4d67061e76530f15f95c25c079e1ca188e"
     EVOLUTION_INSTANCE_NAME: str = "glowlab-bot"
+    EVOLUTION_WEBHOOK_SECRET: Union[str, None] = None
 
     # OpenAI Settings
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_MONTHLY_BUDGET_USD: float = 25.0
 
     # Staff / Equipo de Glowlab
     STAFF_MEMBERS: Dict[str, str] = {
@@ -103,11 +105,11 @@ class Settings(BaseSettings):
     PAYMENT_INFO: str = "Yape o Plin al número que te indicará la asesora"
     ADVANCE_AMOUNT: int = 20
 
-
-
-
-
-
+    # Sentry Observability Settings
+    SENTRY_DSN: Union[str, None] = None
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.1
+    SENTRY_ENVIRONMENT: Union[str, None] = None
 
 
 settings = Settings()
+
