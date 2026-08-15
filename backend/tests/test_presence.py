@@ -14,7 +14,7 @@ from app.modules.salon import services as svc
 
 presence_calls = []
 
-async def mock_send_presence(number: str, presence: str = "composing", delay: int = 1200) -> bool:
+async def mock_send_presence(number: str, presence: str = "composing", delay: int = 1200, **kwargs) -> bool:
     presence_calls.append({"number": number, "presence": presence, "time": time.time()})
     return True
 

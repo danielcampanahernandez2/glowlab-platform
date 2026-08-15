@@ -25,8 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.modules.salon.models import Cita, Cliente, Conversacion, OpenAIUsageLog
-from app.modules.salon.prompts import CLIENT_SYSTEM_PROMPT
+from app.modules.salon.models import Cita, Cliente, Conversacion, OpenAIUsageLog, Tenant, Service, StaffMember
+from app.modules.salon.prompts import CLIENT_SYSTEM_PROMPT, build_tenant_system_prompt, DEFAULT_GLOWLAB_CATALOG
 
 logger = logging.getLogger("glowlab.salon.services")
 
@@ -132,30 +132,157 @@ MONTHS_ES: Dict[int, str] = {
 REDIS_STATE_TTL = 60 * 60 * 48   # 48 horas
 
 # ============================================================
-# CATÁLOGO DE SERVICIOS OFICIAL (SECCIÓN 10 DEL SYSTEM PROMPT)
+# ============================================================
+# CATÁLOGO DE SERVICIOS Y CONFIGURACIÓN DINÁMICA MULTI-TENANT
 # ============================================================
 
 SERVICE_CATALOG: Dict[str, List[Dict[str, Any]]] = {
     "Pestañas": [
-        {"name": "Extensiones naturales", "desc": "Look natural y sutil realizado por lashista", "price": 80},
-        {"name": "Extensiones más definidas", "desc": "Mayor volumen y definición en tu mirada", "price": 100},
-        {"name": "Estilo a medida", "desc": "Diseño personalizado según tu estilo", "price": 50},
+        {"name": "Extensiones naturales", "desc": "Look natural y sutil realizado por lashista", "price": 80, "price_prefix": "desde", "duration_minutes": 60},
+        {"name": "Extensiones más definidas", "desc": "Mayor volumen y definición en tu mirada", "price": 100, "price_prefix": "desde", "duration_minutes": 60},
+        {"name": "Estilo a medida", "desc": "Diseño personalizado según tu estilo", "price": 50, "price_prefix": "desde", "duration_minutes": 60},
     ],
     "Uñas": [
-        {"name": "Pintado", "desc": "Pintado tradicional o semipermanente de uñas", "price": 30},
-        {"name": "Diseños y decoración", "desc": "Arte y decoración personalizada en uñas", "price": 45},
-        {"name": "Otros servicios de uñas", "desc": "Servicios especiales de uñas disponibles en catálogo", "price": 0},
+        {"name": "Pintado", "desc": "Pintado tradicional o semipermanente de uñas", "price": 30, "price_prefix": "desde", "duration_minutes": 30},
+        {"name": "Diseños y decoración", "desc": "Arte y decoración personalizada en uñas", "price": 45, "price_prefix": "desde", "duration_minutes": 45},
+        {"name": "Otros servicios de uñas", "desc": "Servicios especiales de uñas disponibles en catálogo", "price": 0, "duration_minutes": 30},
     ],
     "Tratamientos capilares": [
-        {"name": "Tratamiento de hidratación", "desc": "Nutrición y suavidad profunda para el cabello", "price": 80},
-        {"name": "Tratamiento de keratina", "desc": "Control de frizz, alisado y restauración capilar", "price": 160},
-        {"name": "Botox capilar", "desc": "Mejora la apariencia, suavidad y brillo del cabello", "price": 120},
-        {"name": "Hidratación express", "desc": "Tratamiento rápido de hidratación y brillo", "price": 50},
+        {"name": "Tratamiento de hidratación", "desc": "Nutrición y suavidad profunda para el cabello", "price": 80, "duration_minutes": 60},
+        {"name": "Tratamiento de keratina", "desc": "Control de frizz, alisado y restauración capilar", "price": 160, "duration_minutes": 90},
+        {"name": "Botox capilar", "desc": "Mejora la apariencia, suavidad y brillo del cabello", "price": 120, "duration_minutes": 60},
+        {"name": "Hidratación express", "desc": "Tratamiento rápido de hidratación y brillo", "price": 50, "duration_minutes": 30},
     ],
 }
 
+# Caché en memoria para perfiles y catálogos de tenants
+_tenant_cache: Dict[str, Dict[str, Any]] = {}
 
-def get_service_price(service_name: str) -> Optional[str]:
+
+async def get_tenant_profile(tenant_id: str = "glowlab") -> Dict[str, Any]:
+    """Obtiene el perfil, rubro, etiquetas y reglas de un tenant desde PostgreSQL o memoria."""
+    tenant_profile = {
+        "slug": tenant_id,
+        "name": "Glowlab Salón" if tenant_id == "glowlab" else tenant_id.title(),
+        "industry": "un salón de belleza" if tenant_id == "glowlab" else "un centro de atención profesional",
+        "entity_labels": {
+            "customer": "clienta",
+            "customer_plural": "clientas",
+            "staff": "asesora",
+            "staff_plural": "asesoras",
+            "item": "servicio",
+            "item_plural": "servicios",
+            "booking": "cita",
+            "booking_plural": "citas",
+        },
+        "requires_deposit": True,
+        "deposit_amount": 20.0,
+        "currency": "PEN",
+        "slot_interval_minutes": 60,
+        "plan_name": "pro" if tenant_id == "glowlab" else "starter",
+        "max_appointments_per_month": 500 if tenant_id == "glowlab" else 100,
+        "max_ai_cost_usd_per_month": 50.0 if tenant_id == "glowlab" else 15.0,
+        "billing_cycle_day": 1,
+    }
+
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(select(Tenant).where(Tenant.slug == tenant_id))
+            t = res.scalar_one_or_none()
+            if t:
+                tenant_profile["name"] = t.name
+                tenant_profile["industry"] = t.industry
+                if hasattr(t, "plan_name") and t.plan_name:
+                    tenant_profile["plan_name"] = t.plan_name
+                if hasattr(t, "max_appointments_per_month") and t.max_appointments_per_month is not None:
+                    tenant_profile["max_appointments_per_month"] = int(t.max_appointments_per_month)
+                if hasattr(t, "max_ai_cost_usd_per_month") and t.max_ai_cost_usd_per_month is not None:
+                    tenant_profile["max_ai_cost_usd_per_month"] = float(t.max_ai_cost_usd_per_month)
+                if hasattr(t, "billing_cycle_day") and t.billing_cycle_day is not None:
+                    tenant_profile["billing_cycle_day"] = int(t.billing_cycle_day)
+
+                stg = t.settings or {}
+                if "plan_name" in stg:
+                    tenant_profile["plan_name"] = stg["plan_name"]
+                if "max_appointments_per_month" in stg:
+                    tenant_profile["max_appointments_per_month"] = int(stg["max_appointments_per_month"])
+                if "max_ai_cost_usd_per_month" in stg:
+                    tenant_profile["max_ai_cost_usd_per_month"] = float(stg["max_ai_cost_usd_per_month"])
+                if "billing_cycle_day" in stg:
+                    tenant_profile["billing_cycle_day"] = int(stg["billing_cycle_day"])
+
+                if "entity_labels" in stg:
+                    tenant_profile["entity_labels"].update(stg["entity_labels"])
+                if "requires_deposit" in stg:
+                    tenant_profile["requires_deposit"] = stg["requires_deposit"]
+                if "deposit_amount" in stg:
+                    tenant_profile["deposit_amount"] = float(stg["deposit_amount"])
+                if "slot_interval_minutes" in stg:
+                    tenant_profile["slot_interval_minutes"] = int(stg["slot_interval_minutes"])
+    except Exception as e:
+        logger.debug(f"Aviso leyendo perfil de tenant '{tenant_id}': {e}")
+
+    return tenant_profile
+
+
+async def get_tenant_catalog(tenant_id: str = "glowlab") -> Dict[str, List[Dict[str, Any]]]:
+    """Obtiene el catálogo de servicios de un tenant desde PostgreSQL con fallback seguro."""
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(
+                select(Service).where(Service.tenant_id == tenant_id, Service.is_active == True).order_by(Service.category, Service.price.asc())
+            )
+            services = res.scalars().all()
+            if services:
+                catalog: Dict[str, List[Dict[str, Any]]] = {}
+                for s in services:
+                    catalog.setdefault(s.category, []).append({
+                        "id": s.id,
+                        "name": s.name,
+                        "desc": s.description or "",
+                        "price": float(s.price),
+                        "price_prefix": s.price_prefix or "",
+                        "duration_minutes": s.duration_minutes or 60,
+                    })
+                return catalog
+    except Exception as e:
+        logger.debug(f"Aviso leyendo catálogo de BD para '{tenant_id}': {e}")
+
+    if tenant_id == "glowlab":
+        return SERVICE_CATALOG
+    return {}
+
+
+async def get_tenant_staff(tenant_id: str = "glowlab") -> List[Dict[str, Any]]:
+    """Obtiene el personal registrado para un tenant."""
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(
+                select(StaffMember).where(StaffMember.tenant_id == tenant_id, StaffMember.is_active == True)
+            )
+            staff = res.scalars().all()
+            if staff:
+                return [
+                    {
+                        "name": sm.name,
+                        "phone": sm.phone,
+                        "role": sm.role,
+                        "skills": sm.skills or [],
+                    }
+                    for sm in staff
+                ]
+    except Exception as e:
+        logger.debug(f"Aviso leyendo staff de BD para '{tenant_id}': {e}")
+
+    if tenant_id == "glowlab":
+        return [
+            {"name": "Lizbeth", "phone": "51992509246", "role": "lashista", "skills": ["pestañas", "uñas"]},
+            {"name": "Anali", "phone": "51925528059", "role": "estilista", "skills": ["capilar", "botox", "keratina", "hidratación"]},
+        ]
+    return []
+
+
+def get_service_price(service_name: str, tenant_id: str = "glowlab") -> Optional[str]:
     """Retorna un mensaje formateado con el precio y descripción si el servicio existe."""
     lowered = service_name.lower().strip()
     for cat, cat_services in SERVICE_CATALOG.items():
@@ -209,17 +336,98 @@ def prompt_subservice(category: str) -> str:
 # ============================================================
 
 def parse_fecha(text: str) -> Optional[date]:
-    """Convierte texto en lenguaje natural a un objeto date."""
+    """
+    Convierte texto en lenguaje natural o formatos estándar a un objeto date.
+    Jerarquía de prioridad:
+    1. Fechas explícitas completas con nombre de mes (ej. '21 de agosto', 'el viernes 21 de agosto').
+    2. Formatos numéricos estándar (ej. '2026-08-21', '21/08/2026', '21/08').
+    3. Día de semana + Número de día (ej. 'viernes 21', 'martes 18', 'el 21', 'para el 21').
+    4. Palabras clave relativas ('hoy', 'mañana', 'pasado mañana').
+    5. Día de la semana solo (ej. 'este viernes', 'el próximo lunes' - sin número de día).
+    """
+    if not text:
+        return None
+
     today = date.today()
     s = text.lower().strip()
 
-    if s in ("hoy",):
-        return today
+    month_names = {
+        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+        "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+        "setiembre": 9, "septiembre": 9, "octubre": 10,
+        "noviembre": 11, "diciembre": 12,
+    }
+
+    # 1. Fechas con nombre de mes explícito: ej. '21 de agosto', 'viernes 21 de agosto', '21 de agosto de 2026'
+    month_regex = r'(?:el\s+)?(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)?\s*(\d{1,2})\s+de\s+(' + '|'.join(month_names.keys()) + r')(?:\s+(?:de|del)?\s*(\d{4}))?'
+    m_match = re.search(month_regex, s)
+    if m_match:
+        day_num = int(m_match.group(1))
+        m_name = m_match.group(2)
+        month_num = month_names.get(m_name, today.month)
+        year_num = int(m_match.group(3)) if m_match.group(3) else today.year
+        try:
+            target = date(year_num, month_num, day_num)
+            if not m_match.group(3) and target < today:
+                target = date(year_num + 1, month_num, day_num)
+            return target
+        except ValueError:
+            pass
+
+    # 2. Formatos numéricos estándar: '2026-08-21', '21/08/2026', '21-08-2026'
+    num_match = re.search(r'\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b', s)
+    if num_match:
+        try:
+            return date(int(num_match.group(1)), int(num_match.group(2)), int(num_match.group(3)))
+        except ValueError:
+            pass
+
+    num_match_dmy = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b', s)
+    if num_match_dmy:
+        try:
+            return date(int(num_match_dmy.group(3)), int(num_match_dmy.group(2)), int(num_match_dmy.group(1)))
+        except ValueError:
+            pass
+
+    num_match_short = re.search(r'\b(\d{1,2})[-/](\d{1,2})\b', s)
+    if num_match_short:
+        try:
+            d_val = int(num_match_short.group(1))
+            m_val = int(num_match_short.group(2))
+            res = date(today.year, m_val, d_val)
+            if res < today:
+                res = date(today.year + 1, m_val, d_val)
+            return res
+        except ValueError:
+            pass
+
+    # 3. Día de semana + Número de día o 'el <día>': ej. 'viernes 21', 'el viernes 21', 'martes 18', 'para el 21', 'el 21'
+    day_num_match = re.search(r'(?:el\s+)?(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\s+(\d{1,2})\b', s)
+    if not day_num_match:
+        day_num_match = re.search(r'(?:para\s+el|el)\s+(\d{1,2})\b', s)
+
+    if day_num_match:
+        target_day = int(day_num_match.group(1))
+        if 1 <= target_day <= 31:
+            try:
+                target = date(today.year, today.month, target_day)
+                if target < today:
+                    next_month = today.month + 1 if today.month < 12 else 1
+                    next_year = today.year if today.month < 12 else today.year + 1
+                    target = date(next_year, next_month, target_day)
+                return target
+            except ValueError:
+                pass
+
+    # 4. Palabras clave relativas
     if "pasado mañana" in s or "pasado manana" in s:
         return today + timedelta(days=2)
     if "mañana" in s or "manana" in s:
         return today + timedelta(days=1)
+    if re.search(r'\bhoy\b', s):
+        return today
 
+    # 5. Día de la semana solo (sin número de día)
     day_map = {
         "lunes": 0, "martes": 1,
         "miercoles": 2, "miércoles": 2,
@@ -227,27 +435,12 @@ def parse_fecha(text: str) -> Optional[date]:
         "sabado": 5, "sábado": 5, "domingo": 6,
     }
     for name, num in day_map.items():
-        if name in s:
+        if re.search(r'\b' + name + r'\b', s):
             ahead = num - today.weekday()
             if ahead <= 0:
                 ahead += 7
             return today + timedelta(days=ahead)
 
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text.strip(), fmt).date()
-        except ValueError:
-            pass
-
-    for fmt in ("%d/%m", "%d-%m"):
-        try:
-            parsed = datetime.strptime(text.strip(), fmt)
-            result = parsed.replace(year=today.year).date()
-            if result < today:
-                result = result.replace(year=today.year + 1)
-            return result
-        except ValueError:
-            pass
 
     return None
 
@@ -308,35 +501,37 @@ end
 """
 
 
-def _get_in_memory_phone_lock(phone_norm: str) -> asyncio.Lock:
-    """Obtiene o crea un asyncio.Lock local para el número de teléfono especificado."""
-    if phone_norm not in _in_memory_phone_locks:
-        _in_memory_phone_locks[phone_norm] = asyncio.Lock()
-    return _in_memory_phone_locks[phone_norm]
+def _get_in_memory_phone_lock(phone_norm: str, tenant_id: str = "glowlab") -> asyncio.Lock:
+    """Obtiene o crea un asyncio.Lock local para el número de teléfono y tenant especificado."""
+    key = f"{tenant_id}:{phone_norm}"
+    if key not in _in_memory_phone_locks:
+        _in_memory_phone_locks[key] = asyncio.Lock()
+    return _in_memory_phone_locks[key]
 
 
 @asynccontextmanager
 async def phone_distributed_lock(
     phone: str,
+    tenant_id: str = "glowlab",
     ttl_ms: int = 30000,
     max_wait_sec: float = 25.0,
     retry_interval_sec: float = 0.25,
 ):
     """
-    Lock distribuido en Redis por número de teléfono para serializar el procesamiento
-    de mensajes entrantes del mismo número sin bloquear números distintos.
+    Lock distribuido en Redis por (tenant_id, número de teléfono) para serializar el procesamiento
+    de mensajes entrantes sin bloquear números distintos ni negocios distintos.
 
-    - Clave: glowlab:lock:{phone_norm}
+    - Clave: tenant:{tenant_id}:lock:{phone_norm}
     - Adquisición: SET key token NX PX ttl_ms
     - Espera con reintentos cada ~250ms hasta max_wait_sec si el lock está ocupado
     - Liberación segura con script Lua (solo libera si el token coincide)
     - Fallback a asyncio.Lock local si Redis no está disponible
     """
     phone_norm = normalize_phone(phone)
-    lock_key = f"glowlab:lock:{phone_norm}"
+    lock_key = f"tenant:{tenant_id}:lock:{phone_norm}"
     token = str(uuid.uuid4())
 
-    mem_lock = _get_in_memory_phone_lock(phone_norm)
+    mem_lock = _get_in_memory_phone_lock(phone_norm, tenant_id=tenant_id)
     # 1. Serialización intra-proceso (resguarda concurrencia local)
     await mem_lock.acquire()
 
@@ -357,14 +552,14 @@ async def phone_distributed_lock(
                     # Si no hay cliente Redis configurado, mem_lock provee exclusión
                     break
             except Exception as e:
-                logger.warning(f"Error intentando adquirir lock Redis ({phone_norm}): {e}")
+                logger.warning(f"Error intentando adquirir lock Redis ({tenant_id}:{phone_norm}): {e}")
                 # En caso de desconexión de Redis, se continúa con mem_lock
                 break
 
             elapsed = time.time() - start_time
             if elapsed >= max_wait_sec:
                 logger.error(
-                    f"❌ [LOCK TIMEOUT] No se pudo adquirir el lock de Redis para {phone_norm} "
+                    f"❌ [LOCK TIMEOUT] No se pudo adquirir el lock de Redis para {tenant_id}:{phone_norm} "
                     f"tras {elapsed:.2f}s de espera. Se procederá con precaución."
                 )
                 break
@@ -381,7 +576,7 @@ async def phone_distributed_lock(
                 if r:
                     await r.eval(_RELEASE_LOCK_LUA, 1, lock_key, token)
             except Exception as e:
-                logger.warning(f"Error liberando lock Redis ({phone_norm}): {e}")
+                logger.warning(f"Error liberando lock Redis ({tenant_id}:{phone_norm}): {e}")
 
         # 4. Liberación de lock en memoria
         if mem_lock.locked():
@@ -465,7 +660,10 @@ def _capture_sentry_desync(
 def calculate_openai_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     """Calcula el costo en USD según los tokens de entrada y salida."""
     m = (model or "").lower()
-    if "mini" in m:
+    if "deepseek" in m:
+        input_price = 0.14 / 1_000_000
+        output_price = 0.28 / 1_000_000
+    elif "mini" in m:
         input_price = 0.15 / 1_000_000
         output_price = 0.60 / 1_000_000
     elif "gpt-4o" in m:
@@ -492,13 +690,16 @@ async def log_openai_usage(
     completion_tokens: int,
     total_tokens: int,
     cost_usd: float,
+    tenant_id: str = "glowlab",
 ) -> None:
-    """Registra de forma no bloqueante el consumo de tokens y verifica el umbral mensual."""
+    """Registra de forma no bloqueante el consumo de tokens y verifica el umbral mensual por tenant."""
     try:
         masked_phone = _mask_phone(phone_norm)
         async with async_session_factory() as db:
             log_entry = OpenAIUsageLog(
+                tenant_id=tenant_id,
                 phone_masked=masked_phone,
+                provider=settings.AI_PROVIDER,
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -510,23 +711,23 @@ async def log_openai_usage(
             await db.commit()
 
         # Verificar alerta de presupuesto mensual
-        await _check_monthly_budget_alert()
+        await _check_monthly_budget_alert(tenant_id=tenant_id)
 
     except Exception as e:
-        logger.debug(f"Error registrando uso de OpenAI: {e}")
+        logger.debug(f"Error registrando uso de OpenAI ({tenant_id}): {e}")
 
 
-async def _check_monthly_budget_alert() -> None:
-    """Verifica si el gasto mensual acumulado supera OPENAI_MONTHLY_BUDGET_USD y emite alerta a Sentry."""
+async def _check_monthly_budget_alert(tenant_id: str = "glowlab") -> None:
+    """
+    Verifica si el gasto mensual acumulado supera el umbral preventivo ($25 USD)
+    y el límite del Plan SaaS (Quota Guard), emitiendo alertas a Sentry.
+    """
     global _last_budget_alert_month
     budget_limit = getattr(settings, "OPENAI_MONTHLY_BUDGET_USD", 25.0)
-    if not budget_limit or budget_limit <= 0:
-        return
 
     now = datetime.utcnow()
     current_month_str = now.strftime("%Y-%m")
-    if _last_budget_alert_month == current_month_str:
-        return
+    alert_key = f"{tenant_id}:{current_month_str}"
 
     start_of_month = datetime(now.year, now.month, 1)
 
@@ -535,38 +736,74 @@ async def _check_monthly_budget_alert() -> None:
         async with async_session_factory() as db:
             res = await db.execute(
                 select(func.sum(OpenAIUsageLog.cost_usd)).where(
+                    OpenAIUsageLog.tenant_id == tenant_id,
                     OpenAIUsageLog.created_at >= start_of_month
                 )
             )
             total_month_usd = res.scalar() or 0.0
 
-        if total_month_usd >= budget_limit:
-            _last_budget_alert_month = current_month_str
-            logger.warning(
-                f"🚨 [ALERTA PRESUPUESTO OPENAI] Gasto mensual (${total_month_usd:.2f} USD) "
-                f"ha superado el umbral asignado (${budget_limit:.2f} USD)."
+        profile = await get_tenant_profile(tenant_id)
+        plan_name = profile.get("plan_name", "pro" if tenant_id == "glowlab" else "starter")
+        plan_max_ai = profile.get("max_ai_cost_usd_per_month", 50.0 if tenant_id == "glowlab" else 15.0)
+
+        # 1. Alerta Crítica de Cuota SaaS (Quota Guard)
+        if total_month_usd >= plan_max_ai:
+            logger.critical(
+                f"🚨 [QUOTA GUARD EXCEEDED] Tenant '{tenant_id}' ha superado su cuota de plan '{plan_name}' "
+                f"(${total_month_usd:.2f} / ${plan_max_ai:.2f} USD). Modo alerta crítica activado."
             )
             try:
                 import sentry_sdk
                 with sentry_sdk.push_scope() as scope:
-                    scope.set_tag("budget_alert", "openai_monthly_exceeded")
-                    scope.set_context("budget_info", {
+                    scope.set_tag("alert_type", "quota_exceeded_critical")
+                    scope.set_tag("tenant_id", tenant_id)
+                    scope.set_tag("plan_name", plan_name)
+                    scope.set_context("quota_info", {
+                        "tenant_id": tenant_id,
+                        "plan_name": plan_name,
                         "month": current_month_str,
                         "spent_usd": float(total_month_usd),
-                        "budget_limit_usd": float(budget_limit),
+                        "plan_limit_usd": float(plan_max_ai),
                     })
                     sentry_sdk.capture_message(
-                        f"Alerta de Presupuesto: Gasto mensual de OpenAI (${total_month_usd:.2f} USD) superó el umbral (${budget_limit:.2f} USD)",
-                        level="warning",
+                        f"Alerta Crítica de Cuota SaaS [{tenant_id}]: Gasto mensual de IA (${total_month_usd:.2f} USD) superó el límite del plan '{plan_name}' (${plan_max_ai:.2f} USD)",
+                        level="error",
                     )
             except Exception:
                 pass
+
+        # 2. Alerta Preventiva de Presupuesto ($25 USD)
+        if budget_limit and budget_limit > 0 and total_month_usd >= budget_limit:
+            if _last_budget_alert_month != alert_key:
+                _last_budget_alert_month = alert_key
+                logger.warning(
+                    f"⚠️ [ALERTA PRESUPUESTO OPENAI] Gasto mensual (${total_month_usd:.2f} USD) "
+                    f"ha superado el umbral preventivo (${budget_limit:.2f} USD) para tenant '{tenant_id}'."
+                )
+                try:
+                    import sentry_sdk
+                    with sentry_sdk.push_scope() as scope:
+                        scope.set_tag("budget_alert", "openai_monthly_exceeded")
+                        scope.set_tag("tenant_id", tenant_id)
+                        scope.set_context("budget_info", {
+                            "tenant_id": tenant_id,
+                            "month": current_month_str,
+                            "spent_usd": float(total_month_usd),
+                            "budget_limit_usd": float(budget_limit),
+                        })
+                        sentry_sdk.capture_message(
+                            f"Alerta de Presupuesto [{tenant_id}]: Gasto mensual de OpenAI (${total_month_usd:.2f} USD) superó el umbral (${budget_limit:.2f} USD)",
+                            level="warning",
+                        )
+                except Exception:
+                    pass
+
     except Exception as e:
-        logger.debug(f"Error verificando presupuesto mensual: {e}")
+        logger.debug(f"Error verificando cuota y presupuesto mensual ({tenant_id}): {e}")
 
 
-async def get_openai_cost_report(timeframe: str = "hoy") -> str:
-    """Genera un reporte resumido de consumo de tokens y costo estimado de OpenAI."""
+async def get_openai_cost_report(timeframe: str = "hoy", tenant_id: str = "glowlab") -> str:
+    """Genera un reporte resumido de consumo de tokens y costo estimado de OpenAI para un tenant."""
     now = datetime.utcnow()
     PEN_EXCHANGE_RATE = 3.75  # Tipo de cambio referencial PEN/USD
 
@@ -590,7 +827,10 @@ async def get_openai_cost_report(timeframe: str = "hoy") -> str:
                     func.sum(OpenAIUsageLog.completion_tokens),
                     func.sum(OpenAIUsageLog.total_tokens),
                     func.sum(OpenAIUsageLog.cost_usd),
-                ).where(OpenAIUsageLog.created_at >= start_date)
+                ).where(
+                    OpenAIUsageLog.tenant_id == tenant_id,
+                    OpenAIUsageLog.created_at >= start_date
+                )
             )
             row = res.fetchone()
             if row:
@@ -631,42 +871,51 @@ async def get_openai_cost_report(timeframe: str = "hoy") -> str:
     return "\n".join(lines)
 
 
-async def load_state(phone: str) -> Dict[str, Any]:
-    """Carga estado por teléfono; PostgreSQL es la fuente durable y Redis la caché."""
+async def load_state(phone: str, tenant_id: str = "glowlab") -> Dict[str, Any]:
+    """Carga estado por (tenant_id, teléfono); PostgreSQL es la fuente durable y Redis la caché."""
     phone_norm = normalize_phone(phone)
+    mem_key = f"{tenant_id}:{phone_norm}"
+    redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
     durable_state: Dict[str, Any] = {"paso": "inicial"}
     try:
         async with async_session_factory() as db:
-            result = await db.execute(select(Conversacion.estado).where(Conversacion.phone == phone_norm))
+            result = await db.execute(
+                select(Conversacion.estado).where(
+                    Conversacion.tenant_id == tenant_id,
+                    Conversacion.phone == phone_norm
+                )
+            )
             saved = result.scalar_one_or_none()
             if isinstance(saved, dict):
                 durable_state = dict(saved)
     except Exception as e:
-        logger.warning(f"Error leyendo estado durable ({phone_norm}): {e}")
+        logger.warning(f"Error leyendo estado durable ({tenant_id}:{phone_norm}): {e}")
 
     try:
         r = await _get_redis()
         if r:
-            raw = await r.get(f"glowlab:conv:{phone_norm}")
+            raw = await r.get(redis_key)
             if raw:
                 cached = json.loads(raw)
                 if isinstance(cached, dict) and cached.get("updated_at", "") >= durable_state.get("updated_at", ""):
                     return cached
     except Exception as e:
-        logger.warning(f"Error leyendo estado Redis ({phone_norm}): {e}")
+        logger.warning(f"Error leyendo estado Redis ({tenant_id}:{phone_norm}): {e}")
 
-    if durable_state.get("updated_at") is None and phone_norm in _in_memory_state:
-        return dict(_in_memory_state[phone_norm])
+    if durable_state.get("updated_at") is None and mem_key in _in_memory_state:
+        return dict(_in_memory_state[mem_key])
 
     return durable_state
 
 
-async def save_state(phone: str, state: Dict[str, Any]) -> None:
+async def save_state(phone: str, state: Dict[str, Any], tenant_id: str = "glowlab") -> None:
     """Persiste el estado en PostgreSQL y actualiza la caché Redis con TTL de 48h."""
     phone_norm = normalize_phone(phone)
+    mem_key = f"{tenant_id}:{phone_norm}"
+    redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
     state["updated_at"] = datetime.utcnow().isoformat()
     state_to_save = dict(state)
-    _in_memory_state[phone_norm] = state_to_save
+    _in_memory_state[mem_key] = state_to_save
 
     db_ok = False
     redis_ok = False
@@ -676,74 +925,85 @@ async def save_state(phone: str, state: Dict[str, Any]) -> None:
     try:
         from sqlalchemy.orm.attributes import flag_modified
         async with async_session_factory() as db:
-            result = await db.execute(select(Conversacion).where(Conversacion.phone == phone_norm))
+            result = await db.execute(
+                select(Conversacion).where(
+                    Conversacion.tenant_id == tenant_id,
+                    Conversacion.phone == phone_norm
+                )
+            )
             conversation = result.scalar_one_or_none()
             if conversation:
                 conversation.estado = state_to_save
                 flag_modified(conversation, "estado")
             else:
-                db.add(Conversacion(phone=phone_norm, estado=state_to_save))
+                db.add(Conversacion(tenant_id=tenant_id, phone=phone_norm, estado=state_to_save))
             await db.commit()
             db_ok = True
     except Exception as e:
         db_err_detail = str(e)
-        logger.warning(f"Error guardando estado durable en PostgreSQL ({phone_norm}): {e}")
+        logger.warning(f"Error guardando estado durable en PostgreSQL ({tenant_id}:{phone_norm}): {e}")
 
     try:
         r = await _get_redis()
         if r:
-            await r.setex(
-                f"glowlab:conv:{phone_norm}",
-                REDIS_STATE_TTL,
+            await r.set(
+                redis_key,
                 json.dumps(state_to_save, ensure_ascii=False),
+                ex=REDIS_STATE_TTL,
             )
             redis_ok = True
         else:
             redis_ok = True  # Redis no configurado o modo standalone
     except Exception as e:
         redis_err_detail = str(e)
-        logger.warning(f"Error guardando estado en caché Redis ({phone_norm}): {e}")
+        logger.warning(f"Error guardando estado en caché Redis ({tenant_id}:{phone_norm}): {e}")
 
     # Monitoreo y alerta a Sentry por desincronización entre PostgreSQL y Redis
     if db_ok and not redis_ok:
         logger.warning(
-            f"⚠️ [DESINCRONIZACIÓN DE ESTADO] ({phone_norm}): PostgreSQL persistió correctamente "
+            f"⚠️ [DESINCRONIZACIÓN DE ESTADO] ({tenant_id}:{phone_norm}): PostgreSQL persistió correctamente "
             f"pero falló la actualización en Redis."
         )
         _capture_sentry_desync(phone_norm, "Redis", redis_err_detail)
     elif redis_ok and not db_ok:
         logger.warning(
-            f"⚠️ [DESINCRONIZACIÓN DE ESTADO] ({phone_norm}): Redis actualizó la caché "
+            f"⚠️ [DESINCRONIZACIÓN DE ESTADO] ({tenant_id}:{phone_norm}): Redis actualizó la caché "
             f"pero falló la persistencia durable en PostgreSQL."
         )
         _capture_sentry_desync(phone_norm, "PostgreSQL", db_err_detail)
 
 
-async def clear_state(phone: str) -> None:
-    """Elimina el estado conversacional de una clienta."""
+async def clear_state(phone: str, tenant_id: str = "glowlab") -> None:
+    """Elimina el estado conversacional de una clienta para el tenant especificado."""
     phone_norm = normalize_phone(phone)
-    _in_memory_state.pop(phone_norm, None)
+    mem_key = f"{tenant_id}:{phone_norm}"
+    redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
+    _in_memory_state.pop(mem_key, None)
     try:
         r = await _get_redis()
         if r:
-            await r.delete(f"glowlab:conv:{phone_norm}")
+            await r.delete(redis_key)
     except Exception as e:
-        logger.warning(f"Error borrando estado Redis ({phone_norm}): {e}")
+        logger.warning(f"Error borrando estado Redis ({tenant_id}:{phone_norm}): {e}")
 
-    await save_state(phone_norm, {"paso": "inicial"})
+    await save_state(phone_norm, {"paso": "inicial"}, tenant_id=tenant_id)
 
 
 # ============================================================
 # DETECCIÓN DE ASESORA POR SERVICIO
 # ============================================================
 
-def detect_advisor(servicio: str) -> Optional[str]:
-    """Retorna la asesora interna asignada según el servicio solicitado."""
+def detect_advisor(servicio: str, tenant_id: str = "glowlab") -> Optional[str]:
+    """Retorna la asesora o profesional asignado según el servicio solicitado y tenant."""
+    if not servicio:
+        return "lizbeth" if tenant_id == "glowlab" else "especialista"
     s = servicio.lower()
-    for keyword, advisor in SERVICE_TO_ADVISOR.items():
-        if keyword in s:
-            return advisor
-    return None
+    if tenant_id == "glowlab":
+        for keyword, advisor in SERVICE_TO_ADVISOR.items():
+            if keyword in s:
+                return advisor
+        return "lizbeth"
+    return "especialista"
 
 
 # ============================================================
@@ -751,9 +1011,13 @@ def detect_advisor(servicio: str) -> Optional[str]:
 # ============================================================
 
 async def get_available_slots(
-    db: AsyncSession, advisor: str, target_date: date
+    db: AsyncSession,
+    advisor: str,
+    target_date: date,
+    service_name: Optional[str] = None,
+    tenant_id: str = "glowlab",
 ) -> List[str]:
-    """Retorna los horarios libres de una asesora para una fecha dada."""
+    """Retorna los horarios libres de una asesora/especialista para una fecha dada y tenant específico calculando duración."""
     # Sin atención los domingos
     if target_date.weekday() == 6:
         return []
@@ -762,6 +1026,7 @@ async def get_available_slots(
     result = await db.execute(
         select(Cita.hora).where(
             and_(
+                Cita.tenant_id == tenant_id,
                 Cita.asesora == advisor,
                 Cita.fecha == date_str,
                 Cita.estado.in_(["pendiente", "confirmada"]),
@@ -769,7 +1034,36 @@ async def get_available_slots(
         )
     )
     booked = {row[0] for row in result.fetchall()}
-    return [slot for slot in AVAILABLE_SLOTS if slot not in booked]
+
+    # Intervalo y duración
+    profile = await get_tenant_profile(tenant_id)
+    slot_interval = profile.get("slot_interval_minutes", 60)
+
+    if service_name:
+        try:
+            res_svc = await db.execute(
+                select(Service.duration_minutes).where(
+                    Service.tenant_id == tenant_id,
+                    Service.name.ilike(f"%{service_name}%"),
+                    Service.is_active == True
+                )
+            )
+            svc_dur = res_svc.scalar_one_or_none()
+            if svc_dur and svc_dur > 0:
+                slot_interval = svc_dur
+        except Exception:
+            pass
+
+    if slot_interval == 30:
+        base_slots = [f"{h:02d}:{m:02d}" for h in range(10, 18) for m in (0, 30)]
+    elif slot_interval == 45:
+        base_slots = ["10:00", "10:45", "11:30", "12:15", "14:00", "14:45", "15:30", "16:15", "17:00"]
+    elif slot_interval == 90:
+        base_slots = ["10:00", "11:30", "14:00", "15:30", "17:00"]
+    else:
+        base_slots = AVAILABLE_SLOTS
+
+    return [slot for slot in base_slots if slot not in booked]
 
 
 async def create_cita(
@@ -781,9 +1075,11 @@ async def create_cita(
     fecha: str,
     hora: str,
     observaciones: str = "",
+    tenant_id: str = "glowlab",
 ) -> Cita:
-    """Crea una nueva cita en estado 'pendiente' y actualiza el perfil de la clienta."""
+    """Crea una nueva cita asociada al tenant en estado 'pendiente' y actualiza el perfil del cliente."""
     cita = Cita(
+        tenant_id=tenant_id,
         cliente_phone=cliente_phone,
         cliente_nombre=cliente_nombre or "",
         servicio=servicio,
@@ -798,11 +1094,16 @@ async def create_cita(
     db.add(cita)
     await db.flush()  # obtener el ID sin hacer commit todavía
 
-    # Upsert de la clienta
-    res = await db.execute(select(Cliente).where(Cliente.phone == cliente_phone))
+    # Upsert del cliente con aislamiento por tenant
+    res = await db.execute(
+        select(Cliente).where(
+            Cliente.tenant_id == tenant_id,
+            Cliente.phone == cliente_phone
+        )
+    )
     cliente = res.scalar_one_or_none()
     if not cliente:
-        cliente = Cliente(phone=cliente_phone, nombre=cliente_nombre or "")
+        cliente = Cliente(tenant_id=tenant_id, phone=cliente_phone, nombre=cliente_nombre or "")
         db.add(cliente)
     elif cliente_nombre and not cliente.nombre:
         cliente.nombre = cliente_nombre
@@ -813,10 +1114,15 @@ async def create_cita(
 
 
 async def update_cita_estado(
-    db: AsyncSession, cita_id: int, estado: str, **kwargs
+    db: AsyncSession, cita_id: int, estado: str, tenant_id: str = "glowlab", **kwargs
 ) -> Optional[Cita]:
-    """Actualiza el estado de una cita y cualquier campo adicional pasado como kwargs."""
-    res = await db.execute(select(Cita).where(Cita.id == cita_id))
+    """Actualiza el estado de una cita filtrando por ID y tenant_id."""
+    res = await db.execute(
+        select(Cita).where(
+            Cita.id == cita_id,
+            Cita.tenant_id == tenant_id
+        )
+    )
     cita = res.scalar_one_or_none()
     if cita:
         cita.estado = estado
@@ -940,12 +1246,13 @@ def _fallback_client_reply(state: Dict[str, Any], message: str) -> str:
     if paso == "recolectando_fecha" and state.get("servicio"):
         return f"¡Perfecto! 😊 Para *{state['servicio']}*, ¿qué día te viene mejor?"
 
-    # 12. Si está mostrando horarios y el usuario envió un mensaje relacionado
+    # 12. Si está mostrando horarios y el usuario envió un mensaje relacionado a agendamiento o selección
     if paso == "mostrando_horarios" and state.get("slots_disponibles"):
-        fecha_str = state.get("fecha", "")
-        fecha_obj = parse_fecha(fecha_str) if fecha_str else None
-        fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
-        return build_slots_message(state["slots_disponibles"], fecha_es)
+        if any(k in text_low for k in ("horario", "horarios", "disponibilidad", "qué hora", "que hora", "a qué hora", "a que hora", "libre", "libres", "puedo ir", "tienes espacio", "cita", "agendar", "reservar", "separar", "elijo", "opcion", "opción", "a las")) or message.strip().isdigit():
+            fecha_str = state.get("fecha", "")
+            fecha_obj = parse_fecha(fecha_str) if fecha_str else None
+            fecha_es = format_fecha_es(fecha_obj) if fecha_obj else fecha_str
+            return build_slots_message(state["slots_disponibles"], fecha_es)
 
     # 13. Respuesta por defecto
     return (
@@ -996,9 +1303,9 @@ async def generate_client_reply(
 
     messages.append({"role": "user", "content": message})
 
-    if settings.OPENAI_API_KEY:
+    if settings.has_active_ai_key():
         payload = {
-            "model": settings.OPENAI_MODEL,
+            "model": settings.get_ai_model(),
             "messages": messages,
             "temperature": 0.45,
             "max_tokens": 450,
@@ -1007,11 +1314,8 @@ async def generate_client_reply(
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 res = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
+                    settings.get_ai_endpoint(),
+                    headers=settings.get_ai_headers(),
                     json=payload,
                 )
                 if res.status_code == 200:
@@ -1019,7 +1323,7 @@ async def generate_client_reply(
                     _record_history(state, message, reply)
                     return reply
         except Exception as e:
-            logger.warning(f"Error generando respuesta clienta con OpenAI: {e}")
+            logger.warning(f"Error generando respuesta clienta con IA ({settings.AI_PROVIDER}): {e}")
 
     # Fallback determinista contextual
     if extra_context and "Disponibilidad confirmada" in extra_context and state.get("slots_disponibles"):
@@ -1044,115 +1348,129 @@ def _record_history(state: Dict[str, Any], user_msg: str, assistant_msg: str) ->
     history = state.get("history", [])
     history.append({"role": "user", "content": user_msg})
     history.append({"role": "assistant", "content": assistant_msg})
-    state["history"] = history[-10:]
+    state["history"] = history[-8:]
 
 
 # ============================================================
 # DEFINICIÓN DE HERRAMIENTAS AUTÓNOMAS (OPENAI FUNCTION CALLING)
 # ============================================================
 
-OPENAI_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_services",
-            "description": "Obtiene la lista oficial de servicios, tratamientos y precios de Glowlab (pestañas, uñas, tratamientos capilares).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": ["pestanas", "unas", "capilar", "todos"],
-                        "description": "Categoría opcional para filtrar los servicios disponibles."
+def get_openai_tools(tenant_id: str = "glowlab", categories: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Genera dinámicamente las herramientas de Function Calling según el tenant y sus categorías."""
+    cat_enums = ["todos"]
+    if categories:
+        for c in categories:
+            clean = re.sub(r'[^a-zA-Z0-9_]', '', c.lower().replace(" ", "_"))
+            if clean and clean not in cat_enums:
+                cat_enums.append(clean)
+    else:
+        cat_enums.extend(["pestanas", "unas", "capilar"])
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_services",
+                "description": f"Obtiene la lista oficial de servicios/tratamientos y precios disponibles para {tenant_id}.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": cat_enums,
+                            "description": "Categoría opcional para filtrar los servicios disponibles."
+                        }
                     }
                 }
             }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_available_slots",
-            "description": "Consulta en tiempo real en la base de datos de Glowlab los horarios libres y disponibles para una fecha y servicio.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Fecha a consultar en formato YYYY-MM-DD o lenguaje natural ('mañana', 'lunes', 'sábado', '2026-08-17')."
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_available_slots",
+                "description": "Consulta en tiempo real en la base de datos los horarios libres y disponibles para una fecha y servicio.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Fecha a consultar en formato YYYY-MM-DD o lenguaje natural ('mañana', 'lunes', 'sábado', '2026-08-17')."
+                        },
+                        "service": {
+                            "type": "string",
+                            "description": "Servicio o tratamiento de interés."
+                        }
                     },
-                    "service": {
-                        "type": "string",
-                        "description": "Servicio de interés (ej. 'pestañas', 'uñas', 'botox capilar', 'keratina', 'hidratación')."
-                    }
-                },
-                "required": ["date"]
+                    "required": ["date"]
+                }
             }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_reservation",
-            "description": "Registra una nueva reserva de cita en el sistema una vez que la clienta acordó y confirmó el servicio, fecha y hora.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service": {
-                        "type": "string",
-                        "description": "Nombre del servicio a reservar."
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_reservation",
+                "description": "Registra una nueva reserva de cita en el sistema una vez que el cliente acordó y confirmó el servicio, fecha y hora.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": {
+                            "type": "string",
+                            "description": "Nombre del servicio a reservar."
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "Fecha de la cita en formato YYYY-MM-DD o fecha natural."
+                        },
+                        "time": {
+                            "type": "string",
+                            "description": "Hora seleccionada en formato 24h (ej. '10:00', '14:00', '16:00') o 12h ('10 am', '4 pm')."
+                        },
+                        "client_name": {
+                            "type": "string",
+                            "description": "Nombre del cliente si lo mencionó."
+                        }
                     },
-                    "date": {
-                        "type": "string",
-                        "description": "Fecha de la cita en formato YYYY-MM-DD o fecha natural."
-                    },
-                    "time": {
-                        "type": "string",
-                        "description": "Hora seleccionada en formato 24h (ej. '10:00', '14:00', '16:00') o 12h ('10 am', '4 pm')."
-                    },
-                    "client_name": {
-                        "type": "string",
-                        "description": "Nombre de la clienta si lo mencionó."
-                    }
-                },
-                "required": ["service", "date", "time"]
+                    "required": ["service", "date", "time"]
+                }
             }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_or_reset_reservation",
-            "description": "Cancela la reserva en curso o reinicia el proceso de agendamiento si la clienta indica que ya no desea agendar.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Motivo de la cancelación si fue expresado por la clienta."
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "cancel_or_reset_reservation",
+                "description": "Cancela la reserva en curso o reinicia el proceso de agendamiento si el cliente indica que ya no desea agendar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Motivo de la cancelación si fue expresado."
+                        }
                     }
                 }
             }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "escalate_to_human",
-            "description": "Deriva la conversación a una asesora humana del salón cuando el caso requiere atención especial o excepciones.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "issue": {
-                        "type": "string",
-                        "description": "Detalle del motivo de la derivación al staff humano."
-                    }
-                },
-                "required": ["issue"]
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "escalate_to_human",
+                "description": "Deriva la conversación al personal humano del negocio cuando el caso requiere atención especial o excepciones.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "issue": {
+                            "type": "string",
+                            "description": "Detalle del motivo de la derivación al staff humano."
+                        }
+                    },
+                    "required": ["issue"]
+                }
             }
         }
-    }
-]
+    ]
+
+# Mantenemos OPENAI_TOOLS global para retrocompatibilidad
+OPENAI_TOOLS = get_openai_tools("glowlab", ["pestanas", "unas", "capilar"])
 
 
 async def execute_tool_call(
@@ -1160,18 +1478,27 @@ async def execute_tool_call(
     arguments: Dict[str, Any],
     phone: str,
     state: Dict[str, Any],
+    tenant_id: str = "glowlab",
 ) -> Dict[str, Any]:
-    """Ejecuta de manera asíncrona las herramientas invocadas por el Agente de OpenAI."""
+    """Ejecuta de manera segura la herramienta solicitada por el modelo de IA asociada a un tenant."""
     phone_norm = normalize_phone(phone)
 
     if tool_name == "get_services":
-        cat = arguments.get("category", "todos")
-        if cat in ("pestanas", "unas", "capilar") and cat in ("pestanas", "unas", "capilar"):
-            cat_map = {"pestanas": "Pestañas", "unas": "Uñas", "capilar": "Tratamientos capilares"}
-            cat_name = cat_map.get(cat, "Tratamientos capilares")
-            services = SERVICE_CATALOG.get(cat_name, [])
-            return {"category": cat_name, "services": services}
-        return {"catalog": SERVICE_CATALOG}
+        category = arguments.get("category", "todos").lower()
+        catalog_raw = await get_tenant_catalog(tenant_id)
+
+        # Buscar coincidencia en categorías
+        matched_cat = None
+        for cat_name in catalog_raw.keys():
+            clean_name = re.sub(r'[^a-zA-Z0-9_]', '', cat_name.lower().replace(" ", "_"))
+            if category == clean_name or category in cat_name.lower() or cat_name.lower() in category:
+                matched_cat = cat_name
+                break
+
+        if matched_cat:
+            services = catalog_raw.get(matched_cat, [])
+            return {"category": matched_cat, "services": services}
+        return {"catalog": catalog_raw}
 
     elif tool_name == "get_available_slots":
         raw_date = arguments.get("date", "")
@@ -1181,16 +1508,17 @@ async def execute_tool_call(
         if not target_date:
             return {
                 "status": "error",
-                "message": f"No se pudo determinar la fecha para '{raw_date}'. Solicita a la clienta que indique el día deseado."
+                "message": f"No se pudo determinar la fecha para '{raw_date}'. Solicita al cliente que indique el día deseado."
             }
 
         # Validación de domingos
         if target_date.weekday() == 6:
+            profile = await get_tenant_profile(tenant_id)
             return {
                 "status": "closed",
                 "date": target_date.strftime("%Y-%m-%d"),
                 "date_formatted": format_fecha_es(target_date),
-                "message": "El salón Glowlab permanece cerrado los domingos. Atendemos de lunes a sábado de 10:00 a 18:00."
+                "message": f"{profile.get('name', 'El establecimiento')} permanece cerrado los domingos. Atendemos de lunes a sábado de 10:00 a 18:00."
             }
 
         if target_date < date.today():
@@ -1199,14 +1527,25 @@ async def execute_tool_call(
                 "message": "La fecha solicitada es anterior a hoy. Solicita una fecha actual o futura."
             }
 
-        advisor = detect_advisor(service) or state.get("asesora") or "lizbeth"
+        advisor = detect_advisor(service, tenant_id=tenant_id) or state.get("asesora") or "lizbeth"
         state["asesora"] = advisor
         state["fecha"] = target_date.strftime("%Y-%m-%d")
-        if service:
-            state["servicio"] = service
-
-        async with async_session_factory() as db:
-            slots = await get_available_slots(db, advisor, target_date)
+        slots = []
+        try:
+            async with async_session_factory() as db:
+                slots = await get_available_slots(db, advisor, target_date, service_name=service, tenant_id=tenant_id)
+        except Exception as e:
+            logger.debug(f"Aviso consultando slots en BD ({tenant_id}): {e}")
+            profile = await get_tenant_profile(tenant_id)
+            slot_interval = profile.get("slot_interval_minutes", 60)
+            if slot_interval == 30:
+                slots = [f"{h:02d}:{m:02d}" for h in range(10, 18) for m in (0, 30)]
+            elif slot_interval == 45:
+                slots = ["10:00", "10:45", "11:30", "12:15", "14:00", "14:45", "15:30", "16:15", "17:00"]
+            elif slot_interval == 90:
+                slots = ["10:00", "11:30", "14:00", "15:30", "17:00"]
+            else:
+                slots = AVAILABLE_SLOTS
 
         state["slots_disponibles"] = slots
         fecha_es = format_fecha_es(target_date)
@@ -1244,24 +1583,41 @@ async def execute_tool_call(
         except Exception:
             pass
 
-        advisor = detect_advisor(service) or state.get("asesora") or "lizbeth"
+        advisor = detect_advisor(service, tenant_id=tenant_id) or state.get("asesora") or "lizbeth"
 
-        async with async_session_factory() as db:
-            cita = await create_cita(
-                db=db,
-                cliente_phone=phone_norm,
-                cliente_nombre=client_name,
-                servicio=service,
-                asesora=advisor,
-                fecha=date_str,
-                hora=hora_norm,
-            )
+        profile = await get_tenant_profile(tenant_id)
+        deposit_amount = profile.get("deposit_amount", 20.0)
+        requires_deposit = profile.get("requires_deposit", True)
 
-        state["cita_id"] = cita.id
+        cita_id = 1
+        try:
+            async with async_session_factory() as db:
+                cita = await create_cita(
+                    db=db,
+                    cliente_phone=phone_norm,
+                    cliente_nombre=client_name,
+                    servicio=service,
+                    asesora=advisor,
+                    fecha=date_str,
+                    hora=hora_norm,
+                    tenant_id=tenant_id,
+                )
+                cita_id = cita.id
+        except Exception as e:
+            logger.debug(f"Aviso registrando cita en BD ({tenant_id}): {e}")
+            cita_id = int(time.time()) % 100000
+
+        state["cita_id"] = cita_id
         state["servicio"] = service
         state["fecha"] = date_str
         state["hora"] = hora_norm
-        state["paso"] = "esperando_voucher"
+        state["paso"] = "esperando_voucher" if requires_deposit else "cita_confirmada"
+
+        instruction_msg = (
+            f"Informa al cliente que su cita ha sido pre-registrada con éxito. Explícale que para confirmarla debe abonar el adelanto de S/ {int(deposit_amount) if deposit_amount.is_integer() else deposit_amount} por Yape/Plin y enviar la foto del comprobante aquí."
+            if requires_deposit
+            else "Informa al cliente que su cita ha sido registrada con éxito."
+        )
 
         return {
             "status": "success",
@@ -1271,9 +1627,9 @@ async def execute_tool_call(
             "date_formatted": format_fecha_es(target_date),
             "time": format_hora_12h(hora_norm),
             "client_name": client_name,
-            "advance_amount": settings.ADVANCE_AMOUNT,
+            "advance_amount": deposit_amount,
             "payment_info": settings.PAYMENT_INFO,
-            "instruction": "Informa a la clienta que su cita ha sido pre-registrada con éxito. Explícale que para confirmarla debe abonar el adelanto de S/ 20 por Yape/Plin y enviar la foto del comprobante aquí."
+            "instruction": instruction_msg
         }
 
     elif tool_name == "cancel_or_reset_reservation":
@@ -1285,10 +1641,10 @@ async def execute_tool_call(
         return {"status": "cancelled", "message": "Proceso cancelado. Responde con amabilidad que no hay inconveniente."}
 
     elif tool_name == "escalate_to_human":
-        issue = arguments.get("issue", "Solicitud especial de clienta")
+        issue = arguments.get("issue", "Solicitud especial")
         state["paso"] = "derivada"
-        await notify_all_staff(f"⚠️ Atención especial requerida para +{phone_norm} ({state.get('nombre', '')}):\n\"{issue}\"")
-        return {"status": "escalated", "message": "Notificación enviada al equipo de Glowlab. Indica a la clienta que una asesora se comunicará con ella en breve."}
+        await notify_all_staff(f"⚠️ [{tenant_id}] Atención especial requerida para +{phone_norm} ({state.get('nombre', '')}):\n\"{issue}\"")
+        return {"status": "escalated", "message": f"Notificación enviada al equipo de {tenant_id}. Indica al cliente que un asesor se comunicará en breve."}
 
     return {"status": "error", "message": f"Herramienta '{tool_name}' no reconocida."}
 
@@ -1303,73 +1659,103 @@ async def run_conversational_agent(
     message_text: str,
     message_data: Optional[Dict[str, Any]] = None,
     raw_item: Optional[Dict[str, Any]] = None,
+    tenant_id: str = "glowlab",
 ) -> str:
     """
-    Agente Conversacional Autónomo basado en OpenAI con Function Calling (Tools).
-    Maneja el diálogo, ejecuta herramientas en la base de datos y mantiene la memoria fluida.
+    Agente Conversacional Autónomo basado en OpenAI/DeepSeek con Function Calling (Tools).
+    Maneja el diálogo, ejecuta herramientas en la base de datos y mantiene la memoria fluida por tenant.
     """
     phone_norm = normalize_phone(sender_number)
-    state = await load_state(phone_norm)
+    state = await load_state(phone_norm, tenant_id=tenant_id)
     if sender_name and not state.get("nombre"):
         state["nombre"] = sender_name
 
+    # Perfil y catálogo del tenant activo
+    profile = await get_tenant_profile(tenant_id)
+    catalog_raw = await get_tenant_catalog(tenant_id)
+    categories = list(catalog_raw.keys())
+    active_tools = get_openai_tools(tenant_id=tenant_id, categories=categories)
+
+    # Formatear catálogo para el system prompt
+    prompt_catalog: Dict[str, List[str]] = {}
+    for cat, svcs in catalog_raw.items():
+        prompt_catalog[cat] = [
+            f"{s['name']} ({('desde ' if s.get('price_prefix') == 'desde' else '')}S/ {int(s['price']) if isinstance(s.get('price'), (int, float)) and float(s['price']).is_integer() else s.get('price', 0)})"
+            for s in svcs
+        ]
+
     # Extracción de servicio oficial del catálogo para enriquecer el estado y dar soporte a fallback
     msg_low = message_text.lower()
-    for kw in sorted(OFFICIAL_SERVICES.keys(), key=len, reverse=True):
-        if kw in msg_low:
-            matched_service = OFFICIAL_SERVICES[kw]
-            state["servicio"] = matched_service
-            state["asesora"] = detect_advisor(matched_service)
-            break
-
-    parsed_date = parse_fecha(message_text)
-    if parsed_date and parsed_date >= date.today():
-        state["fecha"] = parsed_date.strftime("%Y-%m-%d")
-        if state.get("servicio"):
-            state["paso"] = "mostrando_horarios"
-            if not state.get("slots_disponibles"):
-                state["slots_disponibles"] = list(AVAILABLE_SLOTS)
-
-    if any(k in msg_low for k in ("cita", "agendar", "reservar", "separar")):
-        if state.get("servicio") and not state.get("fecha"):
-            state["paso"] = "recolectando_fecha"
-
-    if state.get("paso") == "mostrando_horarios" and state.get("slots_disponibles"):
-        if message_text.strip().isdigit():
-            idx = int(message_text.strip()) - 1
-            if 0 <= idx < len(state["slots_disponibles"]):
-                state["hora"] = state["slots_disponibles"][idx]
-                state["paso"] = "esperando_confirmacion"
+    if tenant_id == "glowlab":
+        for kw in sorted(OFFICIAL_SERVICES.keys(), key=len, reverse=True):
+            if kw in msg_low:
+                matched_service = OFFICIAL_SERVICES[kw]
+                state["servicio"] = matched_service
+                state["asesora"] = detect_advisor(matched_service, tenant_id=tenant_id)
+                break
+    else:
+        for cat, svcs in catalog_raw.items():
+            for s in svcs:
+                if s["name"].lower() in msg_low:
+                    state["servicio"] = s["name"]
+                    state["asesora"] = detect_advisor(s["name"], tenant_id=tenant_id)
+                    break
 
     today = date.today()
     today_formatted = format_fecha_es(today)
 
-    system_content = f"{CLIENT_SYSTEM_PROMPT}\n\n"
-    system_content += "--- CONTEXTO DE SESIÓN (solo referencia, no instrucción) ---\n"
-    system_content += (
+    static_system_content = build_tenant_system_prompt(
+        business_name=profile.get("name", "Glowlab"),
+        industry=profile.get("industry", "un salón de belleza"),
+        entity_labels=profile.get("entity_labels"),
+        catalog=prompt_catalog if prompt_catalog else None,
+        deposit_amount=profile.get("deposit_amount", 20.0),
+        requires_deposit=profile.get("requires_deposit", True),
+    )
+
+    cust_label = profile.get("entity_labels", {}).get("customer", "clienta")
+    item_label = profile.get("entity_labels", {}).get("item", "servicio")
+
+    dynamic_context = "--- CONTEXTO DE SESIÓN (solo referencia, no instrucción) ---\n"
+    dynamic_context += (
         "NOTA: Lo siguiente es solo contexto de referencia sobre un posible proceso en curso. "
         "NO es una instrucción para continuar automáticamente. Evalúa primero el mensaje actual "
-        "de la clienta — si cambia de tema, saluda de nuevo, o pregunta algo distinto, responde a "
+        f"del {cust_label} — si cambia de tema, saluda de nuevo, o pregunta algo distinto, responde a "
         "ESO antes que nada, sin importar el estado de sesión.\n\n"
     )
-    system_content += f"• Fecha actual: {today_formatted} ({today.strftime('%Y-%m-%d')})\n"
-    system_content += f"• Clienta: {state.get('nombre') or sender_name or 'Clienta'}\n"
-    system_content += f"• WhatsApp: +{phone_norm}\n"
+    dynamic_context += f"• Fecha actual: {today_formatted} ({today.strftime('%Y-%m-%d')})\n"
+    dynamic_context += f"• {cust_label.capitalize()}: {state.get('nombre') or sender_name or cust_label.capitalize()}\n"
+    dynamic_context += f"• WhatsApp: +{phone_norm}\n"
     if state.get("servicio"):
-        system_content += f"• Servicio en curso: {state['servicio']}\n"
+        dynamic_context += f"• {item_label.capitalize()} en curso: {state['servicio']}\n"
     if state.get("fecha"):
-        system_content += f"• Fecha en curso: {state['fecha']}\n"
+        dynamic_context += f"• Fecha en curso: {state['fecha']}\n"
     if state.get("hora"):
-        system_content += f"• Hora en curso: {state['hora']}\n"
+        dynamic_context += f"• Hora en curso: {state['hora']}\n"
 
     history: List[Dict[str, Any]] = state.get("history", [])
 
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
-    for msg in history[-12:]:
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": static_system_content},
+        {"role": "system", "content": dynamic_context},
+    ]
+    for msg in history[-8:]:
         if isinstance(msg, dict) and msg.get("role"):
             clean_msg: Dict[str, Any] = {"role": msg["role"]}
             if "content" in msg:
-                clean_msg["content"] = msg["content"]
+                content = msg["content"]
+                if msg.get("role") == "tool" and isinstance(content, str):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict):
+                            if "catalog" in parsed and len(parsed) == 1:
+                                parsed = {"status": "ok", "categories": list(parsed["catalog"].keys())}
+                            elif "slots_formatted" in parsed:
+                                parsed.pop("slots_formatted", None)
+                            content = json.dumps(parsed, ensure_ascii=False)
+                    except Exception:
+                        pass
+                clean_msg["content"] = content
             if "tool_calls" in msg:
                 clean_msg["tool_calls"] = msg["tool_calls"]
             if "tool_call_id" in msg:
@@ -1382,29 +1768,29 @@ async def run_conversational_agent(
     fallback_reason = ""
     fallback_exception: Optional[Exception] = None
 
-    if settings.OPENAI_API_KEY:
+    if settings.has_active_ai_key():
+        ai_model = settings.get_ai_model()
+        ai_endpoint = settings.get_ai_endpoint()
+        ai_headers = settings.get_ai_headers()
         try:
             async with httpx.AsyncClient(timeout=25.0) as client:
                 for _ in range(5):  # Máximo 5 rondas de herramientas
                     payload = {
-                        "model": settings.OPENAI_MODEL,
+                        "model": ai_model,
                         "messages": messages,
-                        "tools": OPENAI_TOOLS,
+                        "tools": active_tools,
                         "tool_choice": "auto",
                         "temperature": 0.4,
                         "max_tokens": 500,
                     }
                     res = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
+                        ai_endpoint,
+                        headers=ai_headers,
                         json=payload,
                     )
                     if res.status_code != 200:
-                        fallback_reason = f"OpenAI HTTP {res.status_code}: {res.text[:100]}"
-                        logger.warning(f"OpenAI error {res.status_code}: {res.text[:150]}")
+                        fallback_reason = f"{settings.AI_PROVIDER.capitalize()} HTTP {res.status_code}: {res.text[:100]}"
+                        logger.warning(f"{settings.AI_PROVIDER} error {res.status_code}: {res.text[:150]}")
                         break
 
                     res_json = res.json()
@@ -1415,15 +1801,16 @@ async def run_conversational_agent(
                         p_tok = usage.get("prompt_tokens", 0)
                         c_tok = usage.get("completion_tokens", 0)
                         t_tok = usage.get("total_tokens", p_tok + c_tok)
-                        cost_usd = calculate_openai_cost(settings.OPENAI_MODEL, p_tok, c_tok)
+                        cost_usd = calculate_openai_cost(ai_model, p_tok, c_tok)
                         asyncio.create_task(
                             log_openai_usage(
                                 phone_norm=phone_norm,
-                                model=settings.OPENAI_MODEL,
+                                model=ai_model,
                                 prompt_tokens=p_tok,
                                 completion_tokens=c_tok,
                                 total_tokens=t_tok,
                                 cost_usd=cost_usd,
+                                tenant_id=tenant_id,
                             )
                         )
 
@@ -1439,7 +1826,7 @@ async def run_conversational_agent(
                                 fn_args = json.loads(fn.get("arguments", "{}"))
                             except Exception:
                                 fn_args = {}
-                            tool_result = await execute_tool_call(fn_name, fn_args, phone_norm, state)
+                            tool_result = await execute_tool_call(fn_name, fn_args, phone_norm, state, tenant_id=tenant_id)
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call["id"],
@@ -1451,7 +1838,7 @@ async def run_conversational_agent(
         except Exception as e:
             fallback_reason = f"{type(e).__name__}: {str(e)[:100]}"
             fallback_exception = e
-            logger.error(f"Error en OpenAI Agent Runner: {e}")
+            logger.error(f"Error en {settings.AI_PROVIDER.capitalize()} Agent Runner: {e}")
 
     if not final_reply:
         if fallback_reason:
@@ -1464,7 +1851,7 @@ async def run_conversational_agent(
         final_reply = _fallback_client_reply(state, message_text)
 
     _record_history(state, message_text, final_reply)
-    await save_state(phone_norm, state)
+    await save_state(phone_norm, state, tenant_id=tenant_id)
     return final_reply
 
 
@@ -1592,17 +1979,71 @@ async def validate_voucher(image_base64: str) -> Tuple[bool, str]:
 
 
 # ============================================================
-# CLIENTE EVOLUTION API (ENVÍO DE MENSAJES)
+# RESOLUCIÓN DE INSTANCIAS Y CLIENTE EVOLUTION API MULTI-TENANT
 # ============================================================
 
-async def send_presence(number: str, presence: str = "composing", delay: int = 1200) -> bool:
+async def resolve_tenant_from_instance(instance_name: str) -> Optional[str]:
     """
-    Envía el estado de presencia ('composing', 'paused', etc.) a través de Evolution API.
-    Permite mostrar el indicador 'escribiendo...' en WhatsApp.
+    Resuelve el slug del tenant a partir del nombre de instancia de Evolution API.
+    Utiliza caché en Redis (TTL 24h) con PostgreSQL como fuente de verdad.
     """
-    url = f"{settings.EVOLUTION_API_URL.rstrip('/')}/chat/sendPresence/{settings.EVOLUTION_INSTANCE_NAME}"
+    if not instance_name:
+        return "glowlab"
+
+    clean_instance = instance_name.strip()
+    redis_key = f"evolution:instance:{clean_instance}"
+
+    # 1. Consultar en caché de Redis
+    try:
+        r = await _get_redis()
+        if r:
+            cached_tenant = await r.get(redis_key)
+            if cached_tenant:
+                return cached_tenant
+    except Exception as e:
+        logger.debug(f"Aviso leyendo mapeo de instancia en Redis ({clean_instance}): {e}")
+
+    # 2. Consultar en PostgreSQL
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(select(Tenant).where(Tenant.status == "active"))
+            tenants = res.scalars().all()
+            for t in tenants:
+                stg = t.settings or {}
+                evo_inst = stg.get("evolution_instance") or stg.get("evolution_instance_name") or t.slug
+                if clean_instance.lower() in (t.slug.lower(), str(evo_inst).lower()):
+                    tenant_slug = t.slug
+                    # Guardar en caché Redis
+                    try:
+                        r = await _get_redis()
+                        if r:
+                            await r.set(redis_key, tenant_slug, ex=86400)
+                    except Exception:
+                        pass
+                    return tenant_slug
+    except Exception as e:
+        logger.debug(f"Aviso consultando tenant en BD para instancia '{clean_instance}': {e}")
+
+    # Fallback predeterminado para Glowlab
+    glowlab_instance = getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot")
+    if clean_instance.lower() in ("glowlab", "glowlab-bot", glowlab_instance.lower()):
+        return "glowlab"
+
+    return None
+
+
+async def send_presence(number: str, presence: str = "composing", delay: int = 1200, tenant_id: str = "glowlab") -> bool:
+    """
+    Envía el estado de presencia ('composing', 'paused', etc.) a través de Evolution API usando credenciales del tenant.
+    """
+    profile = await get_tenant_profile(tenant_id)
+    instance_name = profile.get("evolution_instance_name") or profile.get("evolution_instance") or settings.EVOLUTION_INSTANCE_NAME
+    api_key = profile.get("evolution_api_key") or settings.EVOLUTION_API_KEY
+    base_url = (profile.get("evolution_base_url") or settings.EVOLUTION_API_URL).rstrip("/")
+
+    url = f"{base_url}/chat/sendPresence/{instance_name}"
     headers = {
-        "apikey": settings.EVOLUTION_API_KEY,
+        "apikey": api_key,
         "Content-Type": "application/json",
     }
     payload = {
@@ -1615,23 +2056,25 @@ async def send_presence(number: str, presence: str = "composing", delay: int = 1
             res = await client.post(url, headers=headers, json=payload)
             return res.status_code in (200, 201)
     except Exception as e:
-        logger.debug(f"Error enviando estado de presencia ({presence}) a {number}: {e}")
+        logger.debug(f"Error enviando estado de presencia ({presence}) a {number} [{tenant_id}]: {e}")
         return False
 
 
 @asynccontextmanager
-async def typing_indicator(phone: str, refresh_interval: float = 8.0):
+async def typing_indicator(phone: str, refresh_interval: float = 8.0, tenant_id: str = "glowlab"):
     """
     Context manager asíncrono que mantiene activo el estado 'escribiendo...' en WhatsApp
-    mientras se procesa la solicitud (espera en el lock distribuido y consulta a OpenAI).
-    Al salir del contexto, envía el estado 'paused' para limpiar el indicador visual.
+    mientras se procesa la solicitud con la instancia correspondiente al tenant.
     """
     phone_norm = normalize_phone(phone)
     stop_event = asyncio.Event()
 
     async def _presence_loop():
         while not stop_event.is_set():
-            await send_presence(phone_norm, presence="composing")
+            try:
+                await send_presence(phone_norm, presence="composing", tenant_id=tenant_id)
+            except TypeError:
+                await send_presence(phone_norm, presence="composing")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=refresh_interval)
             except asyncio.TimeoutError:
@@ -1647,14 +2090,22 @@ async def typing_indicator(phone: str, refresh_interval: float = 8.0):
             await task
         except (asyncio.CancelledError, Exception):
             pass
-        await send_presence(phone_norm, presence="paused")
+        try:
+            await send_presence(phone_norm, presence="paused", tenant_id=tenant_id)
+        except TypeError:
+            await send_presence(phone_norm, presence="paused")
 
 
-async def send_message(number: str, text: str) -> bool:
-    """Envía un mensaje de texto a través de Evolution API."""
-    url = f"{settings.EVOLUTION_API_URL.rstrip('/')}/message/sendText/{settings.EVOLUTION_INSTANCE_NAME}"
+async def send_message(number: str, text: str, tenant_id: str = "glowlab") -> bool:
+    """Envía un mensaje de texto a través de Evolution API usando la instancia del tenant correspondiente."""
+    profile = await get_tenant_profile(tenant_id)
+    instance_name = profile.get("evolution_instance_name") or profile.get("evolution_instance") or settings.EVOLUTION_INSTANCE_NAME
+    api_key = profile.get("evolution_api_key") or settings.EVOLUTION_API_KEY
+    base_url = (profile.get("evolution_base_url") or settings.EVOLUTION_API_URL).rstrip("/")
+
+    url = f"{base_url}/message/sendText/{instance_name}"
     headers = {
-        "apikey": settings.EVOLUTION_API_KEY,
+        "apikey": api_key,
         "Content-Type": "application/json",
     }
     try:
@@ -1662,18 +2113,20 @@ async def send_message(number: str, text: str) -> bool:
             res = await client.post(url, headers=headers, json={"number": number, "text": text})
             return res.status_code in (200, 201)
     except Exception as e:
-        logger.error(f"Error enviando mensaje a {number}: {e}")
+        logger.error(f"Error enviando mensaje a {number} [{tenant_id}]: {e}")
         return False
 
 
-async def get_media_base64(item: Dict[str, Any]) -> Optional[str]:
+async def get_media_base64(item: Dict[str, Any], tenant_id: str = "glowlab") -> Optional[str]:
     """Descarga el contenido de un mensaje multimedia como base64 desde Evolution API."""
-    url = (
-        f"{settings.EVOLUTION_API_URL.rstrip('/')}"
-        f"/chat/getBase64FromMediaMessage/{settings.EVOLUTION_INSTANCE_NAME}"
-    )
+    profile = await get_tenant_profile(tenant_id)
+    instance_name = profile.get("evolution_instance_name") or profile.get("evolution_instance") or settings.EVOLUTION_INSTANCE_NAME
+    api_key = profile.get("evolution_api_key") or settings.EVOLUTION_API_KEY
+    base_url = (profile.get("evolution_base_url") or settings.EVOLUTION_API_URL).rstrip("/")
+
+    url = f"{base_url}/chat/getBase64FromMediaMessage/{instance_name}"
     headers = {
-        "apikey": settings.EVOLUTION_API_KEY,
+        "apikey": api_key,
         "Content-Type": "application/json",
     }
     try:
@@ -1687,7 +2140,7 @@ async def get_media_base64(item: Dict[str, Any]) -> Optional[str]:
                 data = res.json()
                 return data.get("base64") or data.get("data", {}).get("base64")
     except Exception as e:
-        logger.error(f"Error obteniendo media base64: {e}")
+        logger.error(f"Error obteniendo media base64 [{tenant_id}]: {e}")
     return None
 
 
@@ -1950,8 +2403,8 @@ def parse_hora_str(text: str) -> Optional[str]:
     return None
 
 
-async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_advisors: bool = False) -> str:
-    """Consulta la agenda en la base de datos y genera un reporte ordenado cronológicamente."""
+async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_advisors: bool = False, tenant_id: str = "glowlab") -> str:
+    """Consulta la agenda en la base de datos y genera un reporte ordenado cronológicamente para un tenant."""
     today = date.today()
     if timeframe in ("mañana", "manana"):
         target_dates = [(today + timedelta(days=1)).strftime("%Y-%m-%d")]
@@ -1967,6 +2420,7 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
         async with async_session_factory() as db:
             query = select(Cita).where(
                 and_(
+                    Cita.tenant_id == tenant_id,
                     Cita.fecha.in_(target_dates),
                     Cita.estado.in_(["pendiente", "confirmada"]),
                 )
@@ -1978,7 +2432,7 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
             result = await db.execute(query)
             citas = result.scalars().all()
     except Exception as e:
-        logger.error(f"Error consultando agenda en BD: {e}")
+        logger.error(f"Error consultando agenda en BD ({tenant_id}): {e}")
         return f"⚠️ Error al consultar la base de datos: {e}"
 
     if not citas:
@@ -2011,8 +2465,8 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
     return "\n".join(lines)
 
 
-async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str) -> str:
-    """Cancela una cita por ID o nombre de clienta, registra auditoría y notifica a la clienta."""
+async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str, tenant_id: str = "glowlab") -> str:
+    """Cancela una cita por ID o nombre de clienta dentro del tenant, registra auditoría y notifica a la clienta."""
     cita = None
     clean_q = query.strip()
     id_match = re.match(r'^(?:#|id\s*)?(\d+)$', clean_q, re.IGNORECASE)
@@ -2021,7 +2475,12 @@ async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str) -> st
         async with async_session_factory() as db:
             if id_match:
                 cita_id = int(id_match.group(1))
-                res = await db.execute(select(Cita).where(Cita.id == cita_id))
+                res = await db.execute(
+                    select(Cita).where(
+                        Cita.id == cita_id,
+                        Cita.tenant_id == tenant_id
+                    )
+                )
                 cita = res.scalar_one_or_none()
                 if not cita or cita.estado == "cancelada":
                     return f"❌ No se encontró ninguna cita activa con el ID #{cita_id}."
@@ -2029,6 +2488,7 @@ async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str) -> st
                 res = await db.execute(
                     select(Cita).where(
                         and_(
+                            Cita.tenant_id == tenant_id,
                             Cita.estado.in_(["pendiente", "confirmada"]),
                             or_(
                                 Cita.cliente_nombre.ilike(f"%{clean_q}%"),
@@ -2062,12 +2522,12 @@ async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str) -> st
             await db.refresh(cita)
 
     except Exception as e:
-        logger.error(f"Error cancelando cita en BD: {e}")
+        logger.error(f"Error cancelando cita en BD ({tenant_id}): {e}")
         return f"⚠️ Error al cancelar la cita: {e}"
 
     # Auditoría
     logger.info(
-        f"📋 [STAFF AUDIT] {staff_name} ({staff_phone}) canceló Cita #{cita.id} "
+        f"📋 [STAFF AUDIT] [{tenant_id}] {staff_name} ({staff_phone}) canceló Cita #{cita.id} "
         f"(Clienta: {cita.cliente_nombre}, Tel: {cita.cliente_phone}, Fecha: {cita.fecha}, Hora: {cita.hora}, Servicio: {cita.servicio})"
     )
 
@@ -2098,8 +2558,8 @@ async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str) -> st
     )
 
 
-async def move_staff_cita(staff_name: str, staff_phone: str, query: str) -> str:
-    """Reprograma una cita por ID o nombre de clienta, registra auditoría y notifica a la clienta."""
+async def move_staff_cita(staff_name: str, staff_phone: str, query: str, tenant_id: str = "glowlab") -> str:
+    """Reprograma una cita por ID o nombre de clienta dentro del tenant, registra auditoría y notifica a la clienta."""
     parts = re.split(r'\s+(?:a|para)\s+', query, maxsplit=1, flags=re.IGNORECASE)
     if len(parts) < 2:
         return (
@@ -2132,7 +2592,12 @@ async def move_staff_cita(staff_name: str, staff_phone: str, query: str) -> str:
         async with async_session_factory() as db:
             if id_match:
                 cita_id = int(id_match.group(1))
-                res = await db.execute(select(Cita).where(Cita.id == cita_id))
+                res = await db.execute(
+                    select(Cita).where(
+                        Cita.id == cita_id,
+                        Cita.tenant_id == tenant_id
+                    )
+                )
                 cita = res.scalar_one_or_none()
                 if not cita or cita.estado == "cancelada":
                     return f"❌ No se encontró ninguna cita activa con el ID #{cita_id}."
@@ -2140,6 +2605,7 @@ async def move_staff_cita(staff_name: str, staff_phone: str, query: str) -> str:
                 res = await db.execute(
                     select(Cita).where(
                         and_(
+                            Cita.tenant_id == tenant_id,
                             Cita.estado.in_(["pendiente", "confirmada"]),
                             or_(
                                 Cita.cliente_nombre.ilike(f"%{target_q}%"),
@@ -2180,12 +2646,12 @@ async def move_staff_cita(staff_name: str, staff_phone: str, query: str) -> str:
             await db.refresh(cita)
 
     except Exception as e:
-        logger.error(f"Error moviendo cita en BD: {e}")
+        logger.error(f"Error moviendo cita en BD ({tenant_id}): {e}")
         return f"⚠️ Error al reprogramar la cita: {e}"
 
     # Auditoría
     logger.info(
-        f"📋 [STAFF AUDIT] {staff_name} ({staff_phone}) reprogramó Cita #{cita.id} "
+        f"📋 [STAFF AUDIT] [{tenant_id}] {staff_name} ({staff_phone}) reprogramó Cita #{cita.id} "
         f"(Clienta: {cita.cliente_nombre}, Tel: {cita.cliente_phone}) de [{old_fecha} {old_hora}] a [{cita.fecha} {cita.hora}]"
     )
 
@@ -2243,52 +2709,53 @@ async def execute_staff_command(
     staff_phone: str,
     staff_name: str,
     message: str,
+    tenant_id: str = "glowlab",
 ) -> str:
     """
-    Parser determinista de comandos para gestión de agenda por parte del Staff (Lizbeth / Anali).
+    Parser determinista de comandos para gestión de agenda por parte del Staff asociado al tenant.
     """
     raw = message.strip()
     s = raw.lower()
 
     # 1. Consultar Citas / Agenda
     if s in ("citas hoy", "citas", "agenda hoy", "agenda", "ver citas hoy", "mis citas hoy", "mis citas"):
-        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=False)
+        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=False, tenant_id=tenant_id)
 
     if s in ("citas mañana", "citas manana", "agenda mañana", "agenda manana", "ver citas mañana", "ver citas manana"):
-        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=False)
+        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=False, tenant_id=tenant_id)
 
     if s in ("citas semana", "agenda semana", "ver citas semana", "mis citas semana"):
-        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=False)
+        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=False, tenant_id=tenant_id)
 
     if s in ("citas todas", "agenda todas", "citas todas hoy", "ver todas las citas"):
-        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=True)
+        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
 
     if s in ("citas todas mañana", "citas todas manana"):
-        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=True)
+        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
 
     if s in ("citas todas semana", "todas las citas semana"):
-        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=True)
+        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=True, tenant_id=tenant_id)
 
     # 2. Cancelar Cita (cancelar cita <query>, cancelar <query>, anular cita <query>)
     cancel_match = re.match(r'^(?:cancelar\s+cita|cancelar|anular\s+cita|anular)\s+(.+)$', s)
     if cancel_match:
         query = cancel_match.group(1).strip()
-        return await cancel_staff_cita(staff_name, staff_phone, query)
+        return await cancel_staff_cita(staff_name, staff_phone, query, tenant_id=tenant_id)
 
     # 3. Mover / Reprogramar Cita (mover cita <query> a <nueva_fecha_hora>, etc.)
     move_match = re.match(r'^(?:mover\s+cita|mover|reprogramar\s+cita|reprogramar|cambiar\s+cita)\s+(.+)$', s)
     if move_match:
         query = move_match.group(1).strip()
-        return await move_staff_cita(staff_name, staff_phone, query)
+        return await move_staff_cita(staff_name, staff_phone, query, tenant_id=tenant_id)
 
     # 4. Reporte de Costo y Consumo OpenAI (costo openai hoy, costo openai mes, etc.)
     if any(s.startswith(k) for k in ("costo openai", "costo ia", "gasto openai", "gasto ia", "consumo openai", "consumo ia")):
         if "mes" in s:
-            return await get_openai_cost_report(timeframe="mes")
+            return await get_openai_cost_report(timeframe="mes", tenant_id=tenant_id)
         elif "semana" in s:
-            return await get_openai_cost_report(timeframe="semana")
+            return await get_openai_cost_report(timeframe="semana", tenant_id=tenant_id)
         else:
-            return await get_openai_cost_report(timeframe="hoy")
+            return await get_openai_cost_report(timeframe="hoy", tenant_id=tenant_id)
 
     # 5. Ayuda / Comandos no reconocidos
     return get_staff_help(staff_name)

@@ -11,7 +11,11 @@ async def mock_send(phone, text):
     captured_replies.append(text)
     return True
 
+async def mock_presence(phone, presence="composing", delay=1200):
+    return True
+
 svc.send_message = mock_send
+svc.send_presence = mock_presence
 
 async def test_greeting_and_services_not_blocked_by_slots():
     test_phone = "51911223344"

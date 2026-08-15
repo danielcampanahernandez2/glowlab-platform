@@ -90,10 +90,87 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error al crear tablas: {e}")
 
-    # 2. Verificar conectividad
+    # 2. Verificar conectividad y asegurar tenant por defecto
     db_connected = await check_database_connection()
     if db_connected:
         logger.info("✅ Conexión a PostgreSQL establecida.")
+        try:
+            from sqlalchemy import select, update
+            from app.core.database import async_session_factory
+            from app.modules.salon.models import Tenant, Cliente, Conversacion, Cita, OpenAIUsageLog, Service, StaffMember
+            async with async_session_factory() as db:
+                # 1. Crear tenant 'glowlab' si no existe
+                res = await db.execute(select(Tenant).where(Tenant.slug == "glowlab"))
+                tenant = res.scalar_one_or_none()
+                if not tenant:
+                    tenant = Tenant(
+                        slug="glowlab",
+                        name="Glowlab Salón",
+                        industry="un salón de belleza",
+                        status="active",
+                        plan_name="pro",
+                        max_appointments_per_month=500,
+                        max_ai_cost_usd_per_month=50.0,
+                        billing_cycle_day=1,
+                        settings={
+                            "entity_labels": {
+                                "customer": "clienta",
+                                "customer_plural": "clientas",
+                                "staff": "asesora",
+                                "staff_plural": "asesoras",
+                                "item": "servicio",
+                                "item_plural": "servicios",
+                                "booking": "cita",
+                                "booking_plural": "citas",
+                            },
+                            "slot_interval_minutes": 60,
+                            "requires_deposit": True,
+                            "deposit_amount": 20.0,
+                            "currency": "PEN",
+                            "evolution_instance": getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot"),
+                        }
+                    )
+                    db.add(tenant)
+                    await db.commit()
+                    logger.info("✅ Tenant por defecto 'glowlab' inicializado.")
+
+                # 2. Migrar Catálogo de Servicios oficial de Glowlab a la tabla 'services'
+                res_svc = await db.execute(select(Service).where(Service.tenant_id == "glowlab"))
+                if not res_svc.scalars().all():
+                    glowlab_services = [
+                        Service(tenant_id="glowlab", name="Extensiones naturales", category="Pestañas", price=80.0, price_prefix="desde", duration_minutes=60, description="Look natural y sutil realizado por lashista"),
+                        Service(tenant_id="glowlab", name="Extensiones más definidas", category="Pestañas", price=100.0, price_prefix="desde", duration_minutes=60, description="Mayor volumen y definición en tu mirada"),
+                        Service(tenant_id="glowlab", name="Estilo a medida", category="Pestañas", price=50.0, price_prefix="desde", duration_minutes=60, description="Diseño personalizado según tu estilo"),
+                        Service(tenant_id="glowlab", name="Pintado", category="Uñas", price=30.0, price_prefix="desde", duration_minutes=30, description="Pintado tradicional o semipermanente de uñas"),
+                        Service(tenant_id="glowlab", name="Diseños y decoración", category="Uñas", price=45.0, price_prefix="desde", duration_minutes=45, description="Arte y decoración personalizada en uñas"),
+                        Service(tenant_id="glowlab", name="Tratamiento de hidratación", category="Tratamientos capilares", price=80.0, duration_minutes=60, description="Nutrición y suavidad profunda para el cabello"),
+                        Service(tenant_id="glowlab", name="Botox capilar", category="Tratamientos capilares", price=120.0, duration_minutes=60, description="Mejora la apariencia, suavidad y brillo del cabello"),
+                        Service(tenant_id="glowlab", name="Keratina", category="Tratamientos capilares", price=160.0, duration_minutes=90, description="Control de frizz, alisado y restauración capilar"),
+                        Service(tenant_id="glowlab", name="Hidratación express", category="Tratamientos capilares", price=50.0, duration_minutes=30, description="Tratamiento rápido de hidratación y brillo"),
+                    ]
+                    db.add_all(glowlab_services)
+                    await db.commit()
+                    logger.info("✅ Catálogo de servicios de Glowlab inicializado en BD.")
+
+                # 3. Migrar Staff Members de Glowlab a la tabla 'staff_members'
+                res_staff = await db.execute(select(StaffMember).where(StaffMember.tenant_id == "glowlab"))
+                if not res_staff.scalars().all():
+                    glowlab_staff = [
+                        StaffMember(tenant_id="glowlab", name="Lizbeth", phone="51992509246", role="lashista", skills=["pestañas", "cejas", "uñas"]),
+                        StaffMember(tenant_id="glowlab", name="Anali", phone="51925528059", role="estilista", skills=["uñas", "manicure", "pedicure", "botox", "keratina", "hidratación"]),
+                    ]
+                    db.add_all(glowlab_staff)
+                    await db.commit()
+                    logger.info("✅ Miembros del Staff de Glowlab inicializados en BD.")
+
+                # 4. Migración/backfill de registros históricos sin tenant_id
+                await db.execute(update(Cliente).where(Cliente.tenant_id == None).values(tenant_id="glowlab"))
+                await db.execute(update(Conversacion).where(Conversacion.tenant_id == None).values(tenant_id="glowlab"))
+                await db.execute(update(Cita).where(Cita.tenant_id == None).values(tenant_id="glowlab"))
+                await db.execute(update(OpenAIUsageLog).where(OpenAIUsageLog.tenant_id == None).values(tenant_id="glowlab"))
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"Aviso inicializando tenant por defecto: {e}")
     else:
         logger.warning("⚠️  No se pudo conectar a PostgreSQL al iniciar.")
 

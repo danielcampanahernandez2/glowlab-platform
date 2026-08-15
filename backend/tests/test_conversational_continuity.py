@@ -11,7 +11,11 @@ async def mock_send(phone, text):
     captured_replies.append(text)
     return True
 
+async def mock_presence(phone, presence="composing", delay=1200):
+    return True
+
 svc.send_message = mock_send
+svc.send_presence = mock_presence
 
 async def test_full_conversational_continuity():
     test_phone = "51988776655"

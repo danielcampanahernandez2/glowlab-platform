@@ -27,20 +27,21 @@ router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 # ============================================================
 
 async def handle_staff_message(
-    staff_phone: str, staff_name: str, message_text: str
+    staff_phone: str, staff_name: str, message_text: str, tenant_id: str = "glowlab"
 ) -> None:
     """
-    Procesa comandos enviados por las asesoras del equipo (Lizbeth / Anali)
+    Procesa comandos enviados por las asesoras del equipo dentro de su tenant
     de forma 100% determinista (sin LLM) para garantizar velocidad y precisión.
     """
-    logger.info(f"[STAFF COMANDO] {staff_name} ({staff_phone}): {message_text}")
+    logger.info(f"[STAFF COMANDO] [{tenant_id}] {staff_name} ({staff_phone}): {message_text}")
     phone_norm = svc.normalize_phone(staff_phone)
 
-    async with svc.phone_distributed_lock(phone_norm):
+    async with svc.phone_distributed_lock(phone_norm, tenant_id=tenant_id):
         reply = await svc.execute_staff_command(
             staff_phone=phone_norm,
             staff_name=staff_name,
             message=message_text,
+            tenant_id=tenant_id,
         )
         if reply:
             await svc.send_message(phone_norm, reply)
@@ -56,37 +57,39 @@ async def handle_client_message(
     message_text: str,
     message_data: Dict[str, Any],
     raw_item: Dict[str, Any],
+    tenant_id: str = "glowlab",
 ) -> None:
     """
-    Atención de clientas a través del Agente Conversacional Autónomo de Glowlab (OpenAI Tools).
+    Atención de clientas a través del Agente Conversacional Autónomo asociado al tenant.
     Permite diálogo libre, cambios de tema y ejecución autónoma de reservas y consultas.
-    Utiliza lock distribuido por teléfono para garantizar procesamiento serializado y libre de condiciones de carrera.
+    Utiliza lock distribuido por (tenant_id, teléfono) para garantizar procesamiento serializado.
     """
     phone_norm = svc.normalize_phone(sender_number)
     has_image = "imageMessage" in message_data
 
     # Indicador visual de presencia 'escribiendo...' (composing) en WhatsApp
-    # Se activa de inmediato (mientras espera en el lock o procesa con OpenAI)
     async with svc.typing_indicator(phone_norm):
-        async with svc.phone_distributed_lock(phone_norm):
+        async with svc.phone_distributed_lock(phone_norm, tenant_id=tenant_id):
             # Manejo de comprobantes de pago recibidos como imagen
             if has_image:
                 async with async_session_factory() as db:
-                    state = await svc.load_state(phone_norm)
+                    state = await svc.load_state(phone_norm, tenant_id=tenant_id)
                     intent_data = await svc.extract_intent(state, message_text)
                     await _handle_voucher_step(
                         phone_norm, state, message_text,
-                        message_data, raw_item, intent_data, db
+                        message_data, raw_item, intent_data, db,
+                        tenant_id=tenant_id
                     )
                     return
 
-            # Procesamiento inteligente con el Agente Conversacional OpenAI
+            # Procesamiento inteligente con el Agente Conversacional OpenAI/DeepSeek
             reply = await svc.run_conversational_agent(
                 sender_number=phone_norm,
                 sender_name=sender_name,
                 message_text=message_text,
                 message_data=message_data,
                 raw_item=raw_item,
+                tenant_id=tenant_id,
             )
 
             if reply:
@@ -104,8 +107,9 @@ async def _handle_voucher_step(
     raw_item: Dict[str, Any],
     intent_data: Dict[str, Any],
     db: Any,
+    tenant_id: str = "glowlab",
 ) -> None:
-    """Valida el comprobante de pago y confirma o rechaza la cita."""
+    """Valida el comprobante de pago y confirma o rechaza la cita dentro del tenant."""
     has_image = "imageMessage" in message_data
 
     # Excepción explícita (no puede pagar el adelanto)
@@ -113,7 +117,7 @@ async def _handle_voucher_step(
         k in message_text.lower() for k in ("sin adelanto", "no puedo pagar", "excepcion", "excepción")
     ):
         state["paso"] = "derivada"
-        await svc.save_state(sender_number, state)
+        await svc.save_state(sender_number, state, tenant_id=tenant_id)
         await svc.notify_all_staff(
             f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
             f"solicita excepción de adelanto.\n"
@@ -139,14 +143,14 @@ async def _handle_voucher_step(
             state["adelanto_validado"] = True
             if state.get("cita_id"):
                 await svc.update_cita_estado(
-                    db, state["cita_id"], "confirmada", adelanto_pagado=True
+                    db, state["cita_id"], "confirmada", tenant_id=tenant_id, adelanto_pagado=True
                 )
 
             asesora = state.get("asesora", "lizbeth")
             await svc.notify_advisor(asesora, svc.build_staff_notification(state, sender_number))
 
             state["paso"] = "cita_confirmada"
-            await svc.save_state(sender_number, state)
+            await svc.save_state(sender_number, state, tenant_id=tenant_id)
             await svc.send_message(sender_number, svc.build_confirmation_message(state))
 
         else:
@@ -182,15 +186,45 @@ async def _handle_voucher_step(
 
 
 # ============================================================
-# PROCESADOR PRINCIPAL DEL WEBHOOK
+# PROCESADOR PRINCIPAL DEL WEBHOOK MULTI-INSTANCIA
 # ============================================================
 
 async def process_webhook_payload(payload: Dict[str, Any]) -> None:
-    """Enruta cada mensaje entrante según el remitente (staff vs clienta)."""
+    """
+    Enruta cada mensaje entrante resolviendo el tenant a partir de la instancia de Evolution API.
+    Aísla las consultas, staff, y estados conversacionales por cada negocio.
+    """
     try:
-        staff_dict: Dict[str, str] = getattr(
-            settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"}
+        instance_name = (
+            payload.get("instance")
+            or payload.get("instanceName")
+            or payload.get("instance_name")
+            or getattr(settings, "EVOLUTION_INSTANCE_NAME", "glowlab-bot")
         )
+
+        tenant_id = await svc.resolve_tenant_from_instance(instance_name)
+        if not tenant_id:
+            logger.warning(f"⚠️ [WEBHOOK REJECTED] Instancia de Evolution no reconocida o tenant inactivo: '{instance_name}'")
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as scope:
+                    scope.set_tag("webhook_event", "unrecognized_instance")
+                    scope.set_context("payload_info", {"instance": instance_name})
+                    sentry_sdk.capture_message(
+                        f"Instancia de Evolution no registrada o tenant inactivo: '{instance_name}'",
+                        level="warning",
+                    )
+            except Exception:
+                pass
+            return
+
+        # Obtener staff registrado para el tenant
+        staff_list = await svc.get_tenant_staff(tenant_id)
+        staff_dict: Dict[str, str] = {svc.normalize_phone(sm["phone"]): sm["name"] for sm in staff_list}
+        if tenant_id == "glowlab" and not staff_dict:
+            staff_dict = getattr(
+                settings, "STAFF_MEMBERS", {"51992509246": "Lizbeth", "51925528059": "Anali"}
+            )
 
         raw_data = payload.get("data")
         if isinstance(raw_data, list):
@@ -239,13 +273,13 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
             if not message_text.strip() and not has_image:
                 continue
 
-            # ── Enrutamiento por rol ──
+            # ── Enrutamiento por rol y tenant ──
             if sender_number in staff_dict:
                 staff_name = staff_dict[sender_number]
-                await handle_staff_message(sender_number, staff_name, message_text)
+                await handle_staff_message(sender_number, staff_name, message_text, tenant_id=tenant_id)
             else:
                 await handle_client_message(
-                    sender_number, sender_name, message_text, message_data, item
+                    sender_number, sender_name, message_text, message_data, item, tenant_id=tenant_id
                 )
 
     except Exception as e:
@@ -346,6 +380,13 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     event = str(payload.get("event", "")).lower()
     logger.info(f"Webhook recibido y autenticado: [{event}] instancia=[{payload.get('instance')}]")
 
-    background_tasks.add_task(process_webhook_payload, payload)
+    # 1. Encolar en ARQ / Redis Queue (<10ms)
+    from app.worker import enqueue_webhook_payload
+    job_id = await enqueue_webhook_payload(payload)
 
+    if job_id:
+        return {"status": "queued", "job_id": job_id, "event": payload.get("event")}
+
+    # 2. Fallback a BackgroundTasks si Redis no está disponible
+    background_tasks.add_task(process_webhook_payload, payload)
     return {"status": "received", "event": payload.get("event")}

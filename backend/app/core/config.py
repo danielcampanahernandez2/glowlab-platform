@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Security & JWT (Phase 3 base)
     SECRET_KEY: str = "temporary-glowlab-dev-secret-key-change-in-production-min-32-chars"
+    ADMIN_API_KEY: str = "glowlab-admin-supersecret-key-2026"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -90,10 +91,48 @@ class Settings(BaseSettings):
     EVOLUTION_INSTANCE_NAME: str = "glowlab-bot"
     EVOLUTION_WEBHOOK_SECRET: Union[str, None] = None
 
+    # AI Provider Settings (Configurable: "openai" | "deepseek")
+    AI_PROVIDER: str = "openai"
+
     # OpenAI Settings
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_MONTHLY_BUDGET_USD: float = 25.0
+
+    # DeepSeek Settings
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    DEEPSEEK_MODEL: str = "deepseek-chat"
+
+    def get_ai_endpoint(self) -> str:
+        """Retorna el endpoint de completions según el proveedor activo."""
+        if self.AI_PROVIDER.lower() == "deepseek":
+            return f"{self.DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+        return "https://api.openai.com/v1/chat/completions"
+
+    def get_ai_headers(self) -> Dict[str, str]:
+        """Retorna los headers HTTP de autenticación para el proveedor activo."""
+        if self.AI_PROVIDER.lower() == "deepseek":
+            return {
+                "Authorization": f"Bearer {self.DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            }
+        return {
+            "Authorization": f"Bearer {self.OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    def get_ai_model(self) -> str:
+        """Retorna el nombre del modelo correspondiente al proveedor activo."""
+        if self.AI_PROVIDER.lower() == "deepseek":
+            return self.DEEPSEEK_MODEL
+        return self.OPENAI_MODEL
+
+    def has_active_ai_key(self) -> bool:
+        """Indica si el proveedor activo tiene configurada su clave de API."""
+        if self.AI_PROVIDER.lower() == "deepseek":
+            return bool(self.DEEPSEEK_API_KEY)
+        return bool(self.OPENAI_API_KEY)
 
     # Staff / Equipo de Glowlab
     STAFF_MEMBERS: Dict[str, str] = {
