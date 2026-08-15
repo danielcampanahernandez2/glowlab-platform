@@ -1530,6 +1530,8 @@ async def execute_tool_call(
         advisor = detect_advisor(service, tenant_id=tenant_id) or state.get("asesora") or "lizbeth"
         state["asesora"] = advisor
         state["fecha"] = target_date.strftime("%Y-%m-%d")
+        if service:
+            state["servicio"] = service
         slots = []
         try:
             async with async_session_factory() as db:
