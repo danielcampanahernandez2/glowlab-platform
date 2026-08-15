@@ -12,6 +12,7 @@ alembic>=1.13.0,<1.15.0
 
 # Cache & Queues
 redis>=5.0.4,<6.0.0
+arq>=0.25.0,<0.27.0
 
 # Security & Crypto
 passlib[bcrypt]>=1.7.4
