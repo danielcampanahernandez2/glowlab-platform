@@ -107,8 +107,10 @@ class Conversacion(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(String(100), default="glowlab", nullable=False, index=True)
     phone = Column(String(32), nullable=False, index=True)
+    menu_estado = Column(String(50), default="no_iniciado", nullable=False, index=True)
     estado = Column(JSONB, default=dict, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 
 class Cita(Base):

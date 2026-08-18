@@ -14,8 +14,10 @@ import json
 import logging
 import re
 import time
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
+
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -137,17 +139,24 @@ MONTHS_ES: Dict[int, str] = {
 
 REDIS_STATE_TTL = 60 * 60 * 48   # 48 horas
 SESSION_TIMEOUT_SECONDS = 3 * 3600  # 3 horas (10,800 segundos)
+ATENCION_PERSONALIZADA_TIMEOUT_SECONDS = 48 * 3600  # 48 horas (172,800 segundos)
+
+# Estados posibles del menú inicial de WhatsApp
+MENU_ESTADO_NO_INICIADO = "no_iniciado"
+MENU_ESTADO_PENDIENTE = "pendiente_seleccion"
+MENU_ESTADO_ASISTENTE = "asistente_virtual"
+MENU_ESTADO_ATENCION_PERSONALIZADA = "atencion_personalizada"
 
 INTERACTIVE_MENU_MESSAGE = (
-    "¡Hola! ✨ Bienvenida a Glowlab. \n"
+    "¡Hola! ✨ Bienvenida a Glowlab.\n"
     "Para brindarte una mejor atención, te invitamos a elegir una de las siguientes opciones:\n"
     "1️⃣ Asistente virtual: Para ver servicios, consultar precios y agendar tu cita de forma automática y rápida.\n"
     "2️⃣ Atención personalizada: Para consultas directas, dudas específicas o asesoría detallada.\n"
-    "¿Qué opción elijes? Responde con el número."
+    "¿Qué opción elijes? Responde con el número 1 o 2. 😊"
 )
 
 HUMAN_ADVISOR_CONFIRMATION_MESSAGE = (
-    "¡Perfecto! Un asesor se comunicará contigo en breve para brindarte atención personalizada. 🌸"
+    "Perfecto, una asesora tomará tu conversación en breve 😊"
 )
 
 MENU_INVALID_OPTION_MESSAGE = (
@@ -155,6 +164,7 @@ MENU_INVALID_OPTION_MESSAGE = (
     "1️⃣ Asistente virtual: Para ver servicios, consultar precios y agendar tu cita de forma automática y rápida.\n"
     "2️⃣ Atención personalizada: Para consultas directas, dudas específicas o asesoría detallada."
 )
+
 
 
 # ============================================================
@@ -902,18 +912,22 @@ async def load_state(phone: str, tenant_id: str = "glowlab") -> Dict[str, Any]:
     phone_norm = normalize_phone(phone)
     mem_key = f"{tenant_id}:{phone_norm}"
     redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
-    durable_state: Dict[str, Any] = {"paso": "inicial"}
+    durable_state: Dict[str, Any] = {"paso": "inicial", "menu_estado": MENU_ESTADO_NO_INICIADO}
     try:
         async with async_session_factory() as db:
             result = await db.execute(
-                select(Conversacion.estado).where(
+                select(Conversacion.estado, Conversacion.menu_estado).where(
                     Conversacion.tenant_id == tenant_id,
                     Conversacion.phone == phone_norm
                 )
             )
-            saved = result.scalar_one_or_none()
-            if isinstance(saved, dict):
-                durable_state = dict(saved)
+            row = result.first()
+            if row:
+                saved_estado, saved_menu = row[0], row[1]
+                if isinstance(saved_estado, dict):
+                    durable_state = dict(saved_estado)
+                if saved_menu:
+                    durable_state["menu_estado"] = saved_menu
     except Exception as e:
         logger.warning(f"Error leyendo estado durable ({tenant_id}:{phone_norm}): {e}")
 
@@ -924,13 +938,17 @@ async def load_state(phone: str, tenant_id: str = "glowlab") -> Dict[str, Any]:
             if raw:
                 cached = json.loads(raw)
                 if isinstance(cached, dict) and cached.get("updated_at", "") >= durable_state.get("updated_at", ""):
+                    cached.setdefault("menu_estado", MENU_ESTADO_NO_INICIADO)
                     return cached
     except Exception as e:
         logger.warning(f"Error leyendo estado Redis ({tenant_id}:{phone_norm}): {e}")
 
     if durable_state.get("updated_at") is None and mem_key in _in_memory_state:
-        return dict(_in_memory_state[mem_key])
+        st = dict(_in_memory_state[mem_key])
+        st.setdefault("menu_estado", MENU_ESTADO_NO_INICIADO)
+        return st
 
+    durable_state.setdefault("menu_estado", MENU_ESTADO_NO_INICIADO)
     return durable_state
 
 
@@ -940,6 +958,7 @@ async def save_state(phone: str, state: Dict[str, Any], tenant_id: str = "glowla
     mem_key = f"{tenant_id}:{phone_norm}"
     redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
     state["updated_at"] = datetime.utcnow().isoformat()
+    state.setdefault("menu_estado", MENU_ESTADO_NO_INICIADO)
     state_to_save = dict(state)
     _in_memory_state[mem_key] = state_to_save
 
@@ -958,11 +977,13 @@ async def save_state(phone: str, state: Dict[str, Any], tenant_id: str = "glowla
                 )
             )
             conversation = result.scalar_one_or_none()
+            menu_est = state_to_save.get("menu_estado", MENU_ESTADO_NO_INICIADO)
             if conversation:
                 conversation.estado = state_to_save
+                conversation.menu_estado = menu_est
                 flag_modified(conversation, "estado")
             else:
-                db.add(Conversacion(tenant_id=tenant_id, phone=phone_norm, estado=state_to_save))
+                db.add(Conversacion(tenant_id=tenant_id, phone=phone_norm, menu_estado=menu_est, estado=state_to_save))
             await db.commit()
             db_ok = True
     except Exception as e:
@@ -1000,7 +1021,7 @@ async def save_state(phone: str, state: Dict[str, Any], tenant_id: str = "glowla
 
 
 async def clear_state(phone: str, tenant_id: str = "glowlab") -> None:
-    """Elimina el estado conversacional de una clienta para el tenant especificado."""
+    """Elimina el estado conversacional de una clienta para el tenant especificado y reinicia en no_iniciado."""
     phone_norm = normalize_phone(phone)
     mem_key = f"{tenant_id}:{phone_norm}"
     redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
@@ -1013,90 +1034,147 @@ async def clear_state(phone: str, tenant_id: str = "glowlab") -> None:
     except Exception as e:
         logger.warning(f"Error borrando estado Redis ({tenant_id}:{phone_norm}): {e}")
 
-    await save_state(phone_norm, {"paso": "inicial", "session_active": False}, tenant_id=tenant_id)
+    await save_state(
+        phone_norm,
+        {"paso": "inicial", "session_active": False, "menu_estado": MENU_ESTADO_NO_INICIADO},
+        tenant_id=tenant_id
+    )
 
 
 # ============================================================
 # GESTIÓN DE SESIÓN Y MENÚ INTERACTIVO (REDIS + POSTGRESQL)
 # ============================================================
 
-def is_greeting_message(text: str) -> bool:
+def normalize_text_unaccented(text: str) -> str:
+    """Normaliza texto a minúsculas y elimina tildes y caracteres diacríticos."""
+    if not text:
+        return ""
+    text = text.lower().strip()
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def is_menu_trigger_keyword(text: str) -> bool:
     """
-    Detecta si el mensaje es un saludo natural (ej. 'Hola', 'Buenos días', 'Buenas tardes', etc.).
+    Evalúa si el mensaje contiene alguna de las palabras clave de activación del menú inicial:
+    - 'hola'
+    - 'cita'
+    - 'agenda' (o 'agendar')
+    - Cualquier nombre de servicio presente en OFFICIAL_SERVICES o catálogo (pestañas, cabello, uñas, etc.)
+    La búsqueda es case-insensitive y no distingue tildes.
     """
     if not text:
         return False
-    t = text.strip().lower()
-    t_clean = re.sub(r"[^\w\s]", " ", t)
-    tokens = t_clean.split()
-    if not tokens:
+
+    t_norm = normalize_text_unaccented(text)
+    t_clean = re.sub(r"[^\w\s]", " ", t_norm)
+    words = t_clean.split()
+    if not words:
         return False
 
-    greeting_words = {
-        "hola", "holas", "holaa", "holaaa", "buenos", "buenas",
-        "hi", "hey", "hello", "saludos", "start", "inicio", "menu", "menú"
-    }
-    greeting_phrases = [
-        "buenos dias", "buenos días", "buenas tardes", "buenas noches",
-        "hola buenas", "hola buenos dias", "hola buenos días", "hola buenas tardes", "hola buenas noches",
-        "saludos cordiales", "que tal", "qué tal", "buen dia", "buen día"
+    # 1. Palabras clave base requeridas: hola, cita, agenda
+    base_keywords = [
+        "hola", "holas", "holaa", "holaaa", "holi", "holii", "holis",
+        "buenos dias", "buenas tardes", "buenas noches", "buen dia", "saludos", "hi", "hey", "hello",
+        "cita", "citas",
+        "agenda", "agendar", "agendamiento", "reservar", "reserva", "separar",
+        "menu", "inicio", "start",
     ]
 
-    for phrase in greeting_phrases:
-        if phrase in t:
+    for kw in base_keywords:
+        kw_norm = normalize_text_unaccented(kw)
+        if kw_norm in t_norm:
             return True
 
-    if tokens[0] in greeting_words:
-        return True
+    # 2. Servicios del catálogo OFFICIAL_SERVICES
+    for service_kw in OFFICIAL_SERVICES.keys():
+        s_norm = normalize_text_unaccented(service_kw)
+        if s_norm and s_norm in t_norm:
+            return True
+
+    # Palabras clave de especialidades frecuentes (uñas, pestañas, cabello, etc.)
+    extra_service_keywords = [
+        "pestana", "pestanas", "lash", "lashes",
+        "una", "unas", "manicure", "pedicure", "nail", "nails",
+        "cabello", "capilar", "botox", "keratina", "alisado", "hidratacion", "tinte", "mechas", "balayage", "corte",
+        "ceja", "cejas", "depilacion",
+    ]
+    for ekw in extra_service_keywords:
+        if ekw in t_norm:
+            return True
 
     return False
+
+
+def is_greeting_message(text: str) -> bool:
+    """Detecta si el mensaje es un saludo natural."""
+    return is_menu_trigger_keyword(text)
 
 
 def is_scheduling_intent_message(text: str) -> bool:
-    """
-    Detecta si el mensaje contiene intenciones de agendamiento o reserva
-    (ej. 'quiero hacer una cita', 'agendar', 'reservar', 'quiero una cita').
-    """
-    if not text:
-        return False
-    t = text.strip().lower()
-    scheduling_keywords = [
-        "quiero hacer una cita", "quiero una cita", "hacer una cita", "sacar una cita",
-        "quiero agendar", "quisiera agendar", "deseo agendar", "agendar una cita",
-        "agendar cita", "agendar", "quiero reservar", "quisiera reservar",
-        "deseo reservar", "reservar una cita", "reservar cita", "reservar",
-        "separar cita", "separar una cita", "separar turno", "sacar cita",
-        "sacar turno", "pedir cita", "pedir una cita", "solicitar cita",
-        "necesito una cita", "necesito agendar", "necesito reservar"
-    ]
-    for kw in scheduling_keywords:
-        if kw in t:
-            return True
-    return False
+    """Detecta si el mensaje contiene intenciones de agendamiento o reserva."""
+    return is_menu_trigger_keyword(text)
 
 
 def is_interactive_menu_trigger(text: str) -> bool:
     """Verifica si el mensaje es un disparador para presentar el Menú Interactivo."""
-    return is_greeting_message(text) or is_scheduling_intent_message(text)
+    return is_menu_trigger_keyword(text)
 
 
 def is_menu_option_1(text: str) -> bool:
     """Verifica si la respuesta del usuario corresponde a la Opción 1 (Asistente Virtual)."""
-    t = text.strip().lower()
-    if t in ("1", "1.", "1️⃣", "uno", "primera", "opcion 1", "opción 1", "opc 1", "asistente", "asistente virtual", "ia", "robot", "bot"):
+    if not text:
+        return False
+    t_norm = normalize_text_unaccented(text)
+    if t_norm in ("1", "1.", "1)", "1️⃣", "uno", "primera", "opcion 1", "opción 1", "opc 1", "asistente", "asistente virtual", "ia", "robot", "bot"):
         return True
-    if re.match(r"^1(\b|\.|\))", t) or t == "1":
+    if re.match(r"^1(\b|\.|\))", t_norm) or t_norm == "1":
         return True
     return False
 
 
 def is_menu_option_2(text: str) -> bool:
     """Verifica si la respuesta del usuario corresponde a la Opción 2 (Atención Personalizada)."""
-    t = text.strip().lower()
-    if t in ("2", "2.", "2️⃣", "dos", "segunda", "opcion 2", "opción 2", "opc 2", "atencion personalizada", "atención personalizada", "asesor", "asesora", "humano", "persona"):
+    if not text:
+        return False
+    t_norm = normalize_text_unaccented(text)
+    if t_norm in ("2", "2.", "2)", "2️⃣", "dos", "segunda", "opcion 2", "opción 2", "opc 2", "atencion personalizada", "atención personalizada", "asesor", "asesora", "humano", "persona"):
         return True
-    if re.match(r"^2(\b|\.|\))", t) or t == "2":
+    if re.match(r"^2(\b|\.|\))", t_norm) or t_norm == "2":
         return True
+    return False
+
+
+def check_atencion_personalizada_expired(state: Dict[str, Any]) -> bool:
+    """
+    Verifica si han transcurrido más de 48 horas en el estado 'atencion_personalizada'.
+    Si ha expirado, retorna True indicando que debe resetearse a 'no_iniciado'.
+    """
+    if state.get("menu_estado") != MENU_ESTADO_ATENCION_PERSONALIZADA:
+        return False
+
+    atencion_ts = state.get("atencion_personalizada_at") or state.get("last_interaction_at")
+    if atencion_ts is None:
+        return False
+
+    now_ts = time.time()
+    try:
+        if isinstance(atencion_ts, (int, float)):
+            ts = float(atencion_ts)
+        elif isinstance(atencion_ts, str):
+            try:
+                ts = float(atencion_ts)
+            except ValueError:
+                dt = datetime.fromisoformat(atencion_ts)
+                ts = dt.timestamp()
+        else:
+            ts = now_ts
+
+        if (now_ts - ts) > ATENCION_PERSONALIZADA_TIMEOUT_SECONDS:
+            return True
+    except Exception as e:
+        logger.warning(f"Error comprobando expiración de atencion_personalizada: {e}")
+
     return False
 
 
@@ -1151,12 +1229,13 @@ async def check_session_active(state: Dict[str, Any], phone: str, tenant_id: str
 
 async def activate_ai_session(phone: str, state: Dict[str, Any], tenant_id: str = "glowlab") -> None:
     """
-    Activa el flag de sesión de la IA (session_active = True), resetea el temporizador de inactividad
-    y actualiza la clave en Redis con TTL de 3 horas.
+    Activa el flag de sesión de la IA (session_active = True), establece menu_estado = 'asistente_virtual',
+    resetea el temporizador de inactividad y actualiza la clave en Redis con TTL de 3 horas.
     """
     phone_norm = normalize_phone(phone)
     now_ts = time.time()
     state["session_active"] = True
+    state["menu_estado"] = MENU_ESTADO_ASISTENTE
     state["last_interaction_at"] = now_ts
     state["menu_displayed"] = False
     state["paso"] = "asistente_ia"
@@ -1197,6 +1276,7 @@ async def deactivate_ai_session(
         logger.warning(f"Error eliminando clave de sesión en Redis ({tenant_id}:{phone_norm}): {e}")
 
     await save_state(phone_norm, state, tenant_id=tenant_id)
+
 
 
 
@@ -3196,6 +3276,8 @@ def get_staff_help(staff_name: str) -> str:
         f"🔄 *Mover / Reprogramar Cita:*\n"
         f"• `mover cita <ID> a <fecha y hora>` → Ej: _mover cita 12 a mañana 4pm_\n"
         f"• `mover cita <Nombre> a <fecha y hora>` → Ej: _mover cita Valeria a viernes 11am_\n\n"
+        f"🤖 *Control del Bot:*\n"
+        f"• `liberar bot <numero>` → Resetea el menú inicial para un cliente (ej: _liberar bot 992509246_)\n\n"
         f"💰 *Gasto y Consumo de IA (OpenAI):*\n"
         f"• `costo openai hoy` → Consumo de tokens y costo acumulado hoy\n"
         f"• `costo openai mes` → Consumo de tokens y costo acumulado del mes\n\n"
@@ -3255,6 +3337,31 @@ async def execute_staff_command(
         else:
             return await get_openai_cost_report(timeframe="hoy", tenant_id=tenant_id)
 
-    # 5. Ayuda / Comandos no reconocidos
+    # 5. Liberar / Activar / Reset Bot para un número (liberar bot <numero>, activar bot <numero>, reset bot <numero>)
+    bot_match = re.match(r'^(?:liberar\s+bot|activar\s+bot|reset\s+bot|habilitar\s+bot)\s+(.+)$', s)
+    if bot_match:
+        target_raw = bot_match.group(1).strip()
+        target_phone = normalize_phone(target_raw)
+        async with phone_distributed_lock(target_phone, tenant_id=tenant_id):
+            client_state = await load_state(target_phone, tenant_id=tenant_id)
+            client_state["menu_estado"] = MENU_ESTADO_NO_INICIADO
+            client_state["session_active"] = False
+            client_state["paso"] = "inicial"
+            client_state["menu_displayed"] = False
+            client_state.pop("atencion_personalizada_at", None)
+            await save_state(target_phone, client_state, tenant_id=tenant_id)
+
+            try:
+                r = await _get_redis()
+                if r:
+                    await r.delete(f"tenant:{tenant_id}:session:{target_phone}")
+            except Exception:
+                pass
+
+        logger.info(f"🤖 [STAFF COMMAND] {staff_name} ({staff_phone}) liberó el bot para +{target_phone} (menu_estado -> no_iniciado)")
+        return f"✅ Bot liberado para el número +{target_phone}. El menú inicial volverá a activarse ante nuevos mensajes."
+
+    # 6. Ayuda / Comandos no reconocidos
     return get_staff_help(staff_name)
+
 

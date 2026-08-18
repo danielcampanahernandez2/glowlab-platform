@@ -62,11 +62,11 @@ async def handle_client_message(
     tenant_id: str = "glowlab",
 ) -> None:
     """
-    Atención de clientas con Menú Interactivo y control de estados de sesión en Redis.
-    - Saludos o intenciones de agendamiento -> Envía Menú Interactivo (Opción 1: IA, Opción 2: Humano).
-    - Opción 1: Activa la sesión (session_active = True) y OpenAI toma el control.
-    - Opción 2: Desactiva sesión (session_active = False), confirma contacto de asesor y bloquea IA.
-    - Apagado automático: Desactiva la sesión tras confirmar cita o 3 horas de inactividad.
+    Atención de clientas con máquina de estados menu_estado:
+    - no_iniciado: Solo activa el menú si el mensaje contiene keywords (hola, cita, agenda, servicios). Si no hay match, silencio total.
+    - pendiente_seleccion: Opción 1 activa asistente_virtual (IA). Opción 2 activa atencion_personalizada (1 mensaje y silencio). Cualquier otro mensaje se ignora sin insistir.
+    - atencion_personalizada: Silencio total del bot (atiende asesor humano). Resetea tras 48h de inactividad o comando de staff.
+    - asistente_virtual: Flujo conversacional normal con OpenAI.
     """
     phone_norm = svc.normalize_phone(sender_number)
     has_image = "imageMessage" in message_data
@@ -93,36 +93,60 @@ async def handle_client_message(
             if not clean_text:
                 return
 
-            # 2. Verificar estado de sesión y temporizador de inactividad (3 horas)
-            is_active = await svc.check_session_active(state, phone_norm, tenant_id=tenant_id)
-
-            # 3. Evaluar Disparadores del Menú Interactivo (Saludos o Intención de Agendamiento)
-            is_trigger = svc.is_interactive_menu_trigger(clean_text)
-
-            # Disparar menú si la sesión está inactiva, o si se encuentra en pasos iniciales/finalizados/derivados
-            if is_trigger and (not is_active or state.get("paso") in ("inicial", "menu_interactivo", "derivada", "cita_confirmada")):
-                state["menu_displayed"] = True
-                state["paso"] = "menu_interactivo"
+            # 2. Verificar reset por expiración de 48h en atencion_personalizada
+            if svc.check_atencion_personalizada_expired(state):
+                logger.info(f"⏳ [RESET 48H] Reseteando menu_estado a 'no_iniciado' tras 48h en atención personalizada para +{phone_norm}")
+                state["menu_estado"] = svc.MENU_ESTADO_NO_INICIADO
                 state["session_active"] = False
-                state["last_interaction_at"] = time.time()
+                state["paso"] = "inicial"
+                state["menu_displayed"] = False
+                state.pop("atencion_personalizada_at", None)
                 await svc.save_state(phone_norm, state, tenant_id=tenant_id)
-                await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
+
+            menu_estado = state.get("menu_estado", svc.MENU_ESTADO_NO_INICIADO)
+
+            # 3. ESTADO: atencion_personalizada -> Silencio total (asesora humana atiende manualmente)
+            if menu_estado == svc.MENU_ESTADO_ATENCION_PERSONALIZADA:
+                logger.info(f"🔇 [SILENCIO TOTAL] Mensaje de +{phone_norm} ignorado en 'atencion_personalizada': '{clean_text}'")
                 return
 
-            # 4. Evaluar selección cuando el menú está desplegado / esperando respuesta
-            if state.get("menu_displayed") or state.get("paso") == "menu_interactivo":
+            # 4. ESTADO: no_iniciado -> Trigger selectivo por keywords (hola, cita, agenda, catálogo)
+            if menu_estado == svc.MENU_ESTADO_NO_INICIADO:
+                if svc.is_menu_trigger_keyword(clean_text):
+                    state["menu_estado"] = svc.MENU_ESTADO_PENDIENTE
+                    state["menu_displayed"] = True
+                    state["session_active"] = False
+                    state["last_interaction_at"] = time.time()
+                    await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+                    await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
+                    return
+                else:
+                    # Sin match: bot no responde nada y menu_estado se mantiene en no_iniciado
+                    logger.info(f"🔇 [NO INICIADO] Mensaje sin keyword de +{phone_norm} ignorado: '{clean_text}'")
+                    return
+
+            # 5. ESTADO: pendiente_seleccion -> Manejo sin insistencia
+            if menu_estado == svc.MENU_ESTADO_PENDIENTE:
                 if svc.is_menu_option_1(clean_text):
                     # Opción 1: Asistente virtual (OpenAI toma el control)
+                    state["menu_estado"] = svc.MENU_ESTADO_ASISTENTE
                     await svc.activate_ai_session(phone_norm, state, tenant_id=tenant_id)
-                    welcome_ai = (
-                        "¡Perfecto! ✨ Soy tu asistente virtual de Glowlab. 🌸\n"
-                        "¿En qué te puedo ayudar hoy? Puedes consultarme sobre nuestros servicios (pestañas, uñas, tratamientos capilares), precios o agendar tu cita de forma rápida. 😊"
+                    reply = await svc.run_conversational_agent(
+                        sender_number=phone_norm,
+                        sender_name=sender_name,
+                        message_text=message_text,
+                        message_data=message_data,
+                        raw_item=raw_item,
+                        tenant_id=tenant_id,
                     )
-                    await svc.send_message(phone_norm, welcome_ai)
+                    if reply:
+                        await svc.send_message(phone_norm, reply)
                     return
 
                 elif svc.is_menu_option_2(clean_text):
                     # Opción 2: Atención personalizada (Asesor humano)
+                    state["menu_estado"] = svc.MENU_ESTADO_ATENCION_PERSONALIZADA
+                    state["atencion_personalizada_at"] = time.time()
                     await svc.deactivate_ai_session(phone_norm, state, tenant_id=tenant_id, paso="derivada")
                     await svc.send_message(phone_norm, svc.HUMAN_ADVISOR_CONFIRMATION_MESSAGE)
                     await svc.notify_all_staff(
@@ -131,13 +155,26 @@ async def handle_client_message(
                     )
                     return
 
-                elif not is_active:
-                    # Respuesta no reconocida mientras el menú está en espera
-                    await svc.send_message(phone_norm, svc.MENU_INVALID_OPTION_MESSAGE)
+                else:
+                    # Mensaje no coincide con 1 ni 2 -> No responder nada, no reenviar menú, mantener pendiente_seleccion
+                    logger.info(f"🔇 [PENDIENTE SELECCIÓN] Mensaje no reconocido de +{phone_norm} ignorado sin insistir: '{clean_text}'")
                     return
 
-            # 5. Si la sesión de IA está activa: procesar con el Agente Conversacional OpenAI
-            if is_active:
+            # 6. ESTADO: asistente_virtual -> Flujo normal del agente conversacional
+            if menu_estado == svc.MENU_ESTADO_ASISTENTE:
+                is_active = await svc.check_session_active(state, phone_norm, tenant_id=tenant_id)
+                if not is_active:
+                    # Inactividad de 3h -> volver a no_iniciado
+                    state["menu_estado"] = svc.MENU_ESTADO_NO_INICIADO
+                    await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+                    if svc.is_menu_trigger_keyword(clean_text):
+                        state["menu_estado"] = svc.MENU_ESTADO_PENDIENTE
+                        state["menu_displayed"] = True
+                        state["last_interaction_at"] = time.time()
+                        await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+                        await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
+                    return
+
                 state["last_interaction_at"] = time.time()
                 await svc.save_state(phone_norm, state, tenant_id=tenant_id)
 
@@ -149,15 +186,10 @@ async def handle_client_message(
                     raw_item=raw_item,
                     tenant_id=tenant_id,
                 )
-
                 if reply:
                     await svc.send_message(phone_norm, reply)
                 return
 
-            # 6. Si la sesión NO está activa y está en atención personalizada humana: IA bloqueada
-            if state.get("paso") == "derivada" or not is_active:
-                logger.info(f"🔇 [IA BLOQUEADA] Mensaje de +{phone_norm} ignorado por IA en modo atención personalizada: '{clean_text}'")
-                return
 
 
 # ============================================================

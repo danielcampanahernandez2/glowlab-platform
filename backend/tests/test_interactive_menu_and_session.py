@@ -66,7 +66,13 @@ class FakeRedis:
 class DummyDBSession:
     async def __aenter__(self):
         mock_db = MagicMock()
-        mock_db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None), scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))))
+        mock_db.execute = AsyncMock(
+            return_value=MagicMock(
+                first=MagicMock(return_value=None),
+                scalar_one_or_none=MagicMock(return_value=None),
+                scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+            )
+        )
         mock_db.commit = AsyncMock()
         mock_db.refresh = AsyncMock()
         mock_db.add = MagicMock()
@@ -87,6 +93,8 @@ def setup_teardown():
         patch("app.api.v1.endpoints.whatsapp.async_session_factory", side_effect=DummyDBSession),
         patch("app.modules.salon.services.async_session_factory", side_effect=DummyDBSession),
         patch("app.modules.salon.services.send_presence", new=AsyncMock(return_value=True)),
+        patch("app.modules.salon.services.notify_all_staff", new=AsyncMock(return_value=True)),
+        patch("app.modules.salon.services.notify_advisor", new=AsyncMock(return_value=True)),
     ):
         yield fake_redis
         svc._in_memory_state.clear()
@@ -97,11 +105,11 @@ def setup_teardown():
 async def test_exact_interactive_menu_message():
     """Verifica que el mensaje del menú sea exactamente el solicitado."""
     expected = (
-        "¡Hola! ✨ Bienvenida a Glowlab. \n"
+        "¡Hola! ✨ Bienvenida a Glowlab.\n"
         "Para brindarte una mejor atención, te invitamos a elegir una de las siguientes opciones:\n"
         "1️⃣ Asistente virtual: Para ver servicios, consultar precios y agendar tu cita de forma automática y rápida.\n"
         "2️⃣ Atención personalizada: Para consultas directas, dudas específicas o asesoría detallada.\n"
-        "¿Qué opción elijes? Responde con el número."
+        "¿Qué opción elijes? Responde con el número 1 o 2. 😊"
     )
     assert svc.INTERACTIVE_MENU_MESSAGE == expected
 
@@ -120,7 +128,7 @@ async def test_exact_interactive_menu_message():
 ])
 async def test_greeting_triggers_interactive_menu(greeting):
     """Verifica que cualquier saludo dispare el menú interactivo con session_active = False."""
-    phone = "51911110001"
+    phone = f"5191111{abs(hash(greeting)) % 10000:04d}"
     sent_messages = []
 
     with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_messages.append(msg))):
@@ -137,8 +145,7 @@ async def test_greeting_triggers_interactive_menu(greeting):
 
     state = await svc.load_state(phone)
     assert state.get("session_active") is False
-    assert state.get("menu_displayed") is True
-    assert state.get("paso") == "menu_interactivo"
+    assert state.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
 
 
 @pytest.mark.asyncio
@@ -154,7 +161,7 @@ async def test_greeting_triggers_interactive_menu(greeting):
 ])
 async def test_scheduling_intent_triggers_interactive_menu(intent_text):
     """Verifica que las intenciones de agendamiento disparen el menú interactivo."""
-    phone = "51911110002"
+    phone = f"5191112{abs(hash(intent_text)) % 10000:04d}"
     sent_messages = []
 
     with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_messages.append(msg))):
@@ -171,7 +178,7 @@ async def test_scheduling_intent_triggers_interactive_menu(intent_text):
 
     state = await svc.load_state(phone)
     assert state.get("session_active") is False
-    assert state.get("menu_displayed") is True
+    assert state.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
 
 
 @pytest.mark.asyncio
@@ -181,10 +188,13 @@ async def test_option_1_activates_ai_session(option_1_text):
     Verifica que responder '1' active session_active = True y otorgue el control
     de la conversación a la inteligencia artificial de OpenAI.
     """
-    phone = "51911110003"
+    phone = f"5191113{abs(hash(option_1_text)) % 10000:04d}"
     sent_messages = []
 
-    with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_messages.append(msg))):
+    with (
+        patch("app.modules.salon.services.run_conversational_agent", new=AsyncMock(return_value="¡Hola! Soy tu asistente virtual de Glowlab. ✨")),
+        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_messages.append(msg))),
+    ):
         # 1. Saludo inicial (recibe menú)
         await handle_client_message(
             sender_number=phone,
@@ -207,8 +217,7 @@ async def test_option_1_activates_ai_session(option_1_text):
 
         state = await svc.load_state(phone)
         assert state.get("session_active") is True
-        assert state.get("menu_displayed") is False
-        assert state.get("paso") == "asistente_ia"
+        assert state.get("menu_estado") == svc.MENU_ESTADO_ASISTENTE
         assert len(sent_messages) == 1
         assert "asistente virtual" in sent_messages[0].lower() or "glowlab" in sent_messages[0].lower()
 
@@ -234,7 +243,7 @@ async def test_option_2_blocks_ai_and_confirms_human_advisor(option_2_text):
     Verifica que responder '2' mantenga session_active = False, envíe confirmación
     de contacto de asesor, notifique al staff y bloquee las respuestas de la IA.
     """
-    phone = "51911110004"
+    phone = f"5191114{abs(hash(option_2_text)) % 10000:04d}"
     sent_messages = []
     staff_notifications = []
 
@@ -263,7 +272,7 @@ async def test_option_2_blocks_ai_and_confirms_human_advisor(option_2_text):
 
         state = await svc.load_state(phone)
         assert state.get("session_active") is False
-        assert state.get("paso") == "derivada"
+        assert state.get("menu_estado") == svc.MENU_ESTADO_ATENCION_PERSONALIZADA
         assert len(sent_messages) == 1
         assert sent_messages[0] == svc.HUMAN_ADVISOR_CONFIRMATION_MESSAGE
         assert len(staff_notifications) == 1
@@ -283,6 +292,7 @@ async def test_option_2_blocks_ai_and_confirms_human_advisor(option_2_text):
         assert len(sent_messages) == 0
 
 
+
 @pytest.mark.asyncio
 async def test_auto_off_after_appointment_confirmation():
     """
@@ -299,6 +309,7 @@ async def test_auto_off_after_appointment_confirmation():
         "cita_id": 999,
         "paso": "esperando_voucher",
         "session_active": True,
+        "menu_estado": svc.MENU_ESTADO_ASISTENTE,
         "last_interaction_at": time.time(),
     }
     await svc.save_state(phone, state)
@@ -340,6 +351,7 @@ async def test_auto_off_after_3_hours_inactivity_and_menu_reactivation():
         "nombre": "Mariana",
         "servicio": "pestañas",
         "session_active": True,
+        "menu_estado": svc.MENU_ESTADO_ASISTENTE,
         "last_interaction_at": four_hours_ago,
         "paso": "asistente_ia",
     }
@@ -367,19 +379,17 @@ async def test_auto_off_after_3_hours_inactivity_and_menu_reactivation():
 
     state_reactivated = await svc.load_state(phone)
     assert state_reactivated.get("session_active") is False
-    assert state_reactivated.get("menu_displayed") is True
-    assert state_reactivated.get("paso") == "menu_interactivo"
+    assert state_reactivated.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
 
 
 @pytest.mark.asyncio
 async def test_invalid_option_response_prompts_menu_reminder():
-    """Verifica que una respuesta inválida mientras el menú espera opción recuerde las 2 opciones."""
+    """Verifica que una respuesta no reconocida mientras el menú espera opción no insista (sin respuesta)."""
     phone = "51911110007"
     state = {
         "nombre": "Elena",
         "session_active": False,
-        "menu_displayed": True,
-        "paso": "menu_interactivo",
+        "menu_estado": svc.MENU_ESTADO_PENDIENTE,
         "last_interaction_at": time.time(),
     }
     await svc.save_state(phone, state)
@@ -394,5 +404,8 @@ async def test_invalid_option_response_prompts_menu_reminder():
             raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
         )
 
-    assert len(sent_messages) == 1
-    assert sent_messages[0] == svc.MENU_INVALID_OPTION_MESSAGE
+    # No debe responder nada
+    assert len(sent_messages) == 0
+    state_after = await svc.load_state(phone)
+    assert state_after.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
+

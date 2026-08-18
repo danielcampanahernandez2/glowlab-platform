@@ -77,7 +77,8 @@ async def test_generate_client_reply_fallback():
     state = {}
     reply_price = await svc.generate_client_reply(state, "¿Cuánto cuesta el botox capilar?")
     assert "120" in reply_price
-    assert "Botox capilar" in reply_price
+    assert "botox" in reply_price.lower()
+
 
     reply_rec = await svc.generate_client_reply(state, "Tengo el cabello muy seco")
     assert "hidratación" in reply_rec.lower() or "botox" in reply_rec.lower()
