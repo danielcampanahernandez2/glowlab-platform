@@ -138,7 +138,9 @@ class Settings(BaseSettings):
     STAFF_MEMBERS: Dict[str, str] = {
         "51992509246": "Lizbeth",
         "51925528059": "Anali",
+        "51946559792": "Staff Glowlab",
     }
+
 
     # Configuración de Adelanto y Pagos
     PAYMENT_INFO: str = "Yape o Plin al número que te indicará la asesora"

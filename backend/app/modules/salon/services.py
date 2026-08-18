@@ -314,8 +314,10 @@ async def get_tenant_staff(tenant_id: str = "glowlab") -> List[Dict[str, Any]]:
         return [
             {"name": "Lizbeth", "phone": "51992509246", "role": "lashista", "skills": ["pestañas", "uñas"]},
             {"name": "Anali", "phone": "51925528059", "role": "estilista", "skills": ["capilar", "botox", "keratina", "hidratación"]},
+            {"name": "Staff Glowlab", "phone": "51946559792", "role": "administradora", "skills": ["general"]},
         ]
     return []
+
 
 
 def get_service_price(service_name: str, tenant_id: str = "glowlab") -> Optional[str]:

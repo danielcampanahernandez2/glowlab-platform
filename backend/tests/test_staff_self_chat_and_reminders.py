@@ -168,9 +168,48 @@ async def test_self_chat_message_routes_to_staff_and_never_triggers_client_menu(
     assert not state.get("session_active")
 
 
+@pytest.mark.asyncio
+async def test_instance_number_self_chat_routes_to_staff():
+    """
+    Verifica que mensajes dirigidos al número de la instancia (+51 946 559 792)
+    se enruten como staff/self-chat y no activen el flujo de cliente.
+    """
+    instance_phone = "51946559792"
+    sent_replies = []
+
+    payload = {
+        "event": "messages.upsert",
+        "instance": "glowlab-bot",
+        "data": [{
+            "key": {
+                "remoteJid": f"{instance_phone}@s.whatsapp.net",
+                "fromMe": True,
+                "id": "MSG_SELF_INST"
+            },
+            "pushName": "Staff Glowlab",
+            "message": {
+                "conversation": "citas mañana"
+            }
+        }]
+    }
+
+    with (
+        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_replies.append(msg))),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value="📋 Agenda de Citas: 0 citas mañana")),
+    ):
+        await process_webhook_payload(payload)
+
+    assert len(sent_replies) == 1
+    assert "Agenda de Citas" in sent_replies[0]
+    state = await svc.load_state(instance_phone)
+    assert state.get("menu_estado") == svc.MENU_ESTADO_NO_INICIADO
+    assert not state.get("session_active")
+
+
 # ============================================================
 # 2. COMANDOS DE STAFF: ACTIVAR BOT Y LIBERAR BOT (CON DESAMBIGUACIÓN)
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_staff_activar_bot_by_phone():
