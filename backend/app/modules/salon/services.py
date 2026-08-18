@@ -1068,42 +1068,55 @@ def is_menu_trigger_keyword(text: str) -> bool:
 
     t_norm = normalize_text_unaccented(text)
     t_clean = re.sub(r"[^\w\s]", " ", t_norm)
-    words = t_clean.split()
+    words = set(t_clean.split())
     if not words:
         return False
 
-    # 1. Palabras clave base requeridas: hola, cita, agenda
-    base_keywords = [
-        "hola", "holas", "holaa", "holaaa", "holi", "holii", "holis",
-        "buenos dias", "buenas tardes", "buenas noches", "buen dia", "saludos", "hi", "hey", "hello",
-        "cita", "citas",
-        "agenda", "agendar", "agendamiento", "reservar", "reserva", "separar",
-        "menu", "inicio", "start",
+    # 1. Frases compuestas completas
+    phrases = [
+        "buenos dias", "buenas tardes", "buenas noches", "buen dia",
+        "quiero hacer una cita", "quiero una cita", "hacer una cita", "sacar una cita",
+        "quiero agendar", "quisiera agendar", "deseo agendar", "agendar una cita",
+        "agendar cita", "quiero reservar", "quisiera reservar", "deseo reservar",
+        "reservar una cita", "reservar cita", "separar cita", "separar una cita",
+        "sacar cita", "pedir cita", "solicitar cita", "necesito una cita",
+        "botox capilar", "tratamiento de hidratacion", "tratamiento de keratina",
+        "extensiones de pestanas", "extensiones naturales", "diseno de unas", "pintado de unas",
+        "unas acrilicas", "unas en gel", "unas gel", "unas esculpidas"
     ]
-
-    for kw in base_keywords:
-        kw_norm = normalize_text_unaccented(kw)
-        if kw_norm in t_norm:
+    for ph in phrases:
+        if ph in t_clean:
             return True
 
-    # 2. Servicios del catálogo OFFICIAL_SERVICES
+    # 2. Servicios del catálogo OFFICIAL_SERVICES (como frases o palabras)
     for service_kw in OFFICIAL_SERVICES.keys():
         s_norm = normalize_text_unaccented(service_kw)
-        if s_norm and s_norm in t_norm:
+        if " " in s_norm and s_norm in t_clean:
+            return True
+        elif " " not in s_norm and s_norm in words:
             return True
 
-    # Palabras clave de especialidades frecuentes (uñas, pestañas, cabello, etc.)
-    extra_service_keywords = [
+    # 3. Palabras clave y tokens individuales
+    trigger_words = {
+        "hola", "holas", "holaa", "holaaa", "holi", "holii", "holis",
+        "hi", "hey", "hello", "saludos",
+        "cita", "citas",
+        "agenda", "agendar", "agendamiento", "agendo", "agendame",
+        "reserva", "reservar", "reservas", "reservo",
+        "separar", "separo",
         "pestana", "pestanas", "lash", "lashes",
-        "una", "unas", "manicure", "pedicure", "nail", "nails",
+        "unas", "manicure", "pedicure", "nail", "nails",
         "cabello", "capilar", "botox", "keratina", "alisado", "hidratacion", "tinte", "mechas", "balayage", "corte",
         "ceja", "cejas", "depilacion",
-    ]
-    for ekw in extra_service_keywords:
-        if ekw in t_norm:
+    }
+    for w in words:
+        if w in trigger_words:
+            return True
+        if w.startswith("hola") or w.startswith("holi") or w.startswith("agend") or w.startswith("reserv") or w.startswith("pestan"):
             return True
 
     return False
+
 
 
 def is_greeting_message(text: str) -> bool:

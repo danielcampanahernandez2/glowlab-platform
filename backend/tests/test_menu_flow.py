@@ -1,12 +1,12 @@
 """
 Tests para el Flujo del Menú Inicial de WhatsApp con Máquina de Estados 'menu_estado'.
 
-Cubre los 6 requerimientos clave:
-1. Mensaje sin keyword no activa el menú ni responde nada (menu_estado == 'no_iniciado').
-2. Mensaje con keyword activa el menú una sola vez con el texto exacto y pasa a 'pendiente_seleccion'.
-3. Mensaje irrelevante en 'pendiente_seleccion' no responde ni reenvía el menú (sin insistencia).
-4. Opción '1' (y variantes) activa 'asistente_virtual' y entrega el control al agente conversacional.
-5. Opción '2' (y variantes) envía un único mensaje de confirmación, pasa a 'atencion_personalizada' y luego guarda silencio total.
+Cubre los requerimientos actualizados:
+1. Keyword repetida varias veces en no_iniciado/pendiente_seleccion reenvía el mensaje de bienvenida cada vez con el texto exacto.
+2. Mensaje sin keyword y sin '1'/'2' no responde nada (silencio total en no_iniciado y pendiente_seleccion).
+3. Opción '1' (y variantes) activa 'asistente_virtual' y entrega el control al agente conversacional OpenAI.
+4. Opción '2' (y variantes) envía un único mensaje de confirmación, pasa a 'atencion_personalizada' y luego guarda silencio total (incluso ante keywords).
+5. Keyword mientras está en 'atencion_personalizada' no genera ninguna respuesta.
 6. Reset por comando de staff ('liberar bot <numero>') o expiración de 48h en 'atencion_personalizada' vuelve a 'no_iniciado'.
 """
 import asyncio
@@ -101,11 +101,13 @@ def setup_environment():
 
 
 # ============================================================
-# 1. MENSAJE SIN KEYWORD NO ACTIVA EL MENÚ (SILENCIO TOTAL)
+# 1. MENSAJES SIN KEYWORD Y SIN "1"/"2" -> SILENCIO TOTAL
 # ============================================================
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("msg", [
+    "que hiciste en la noche",
+    "mañana iras",
     "ok",
     "gracias",
     "donde estan ubicados?",
@@ -113,10 +115,11 @@ def setup_environment():
     "12345",
     "qwerty",
     "a que hora abren?",
+    "no entiendo nada",
 ])
 async def test_message_without_trigger_keyword_is_ignored(msg):
-    """Verifica que mensajes sin palabras clave de activación no activen el menú ni respondan."""
-    phone = "51911112222"
+    """Verifica que mensajes sin keywords ni 1/2 no activen el menú ni respondan nada."""
+    phone = f"5191111{abs(hash(msg)) % 10000:04d}"
     sent_messages = []
     with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, m: sent_messages.append(m))):
         await handle_client_message(
@@ -127,7 +130,7 @@ async def test_message_without_trigger_keyword_is_ignored(msg):
             raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
         )
 
-    # El bot no debe responder nada
+    # Cero mensajes enviados
     assert len(sent_messages) == 0
     state = await svc.load_state(phone)
     assert state.get("menu_estado") == svc.MENU_ESTADO_NO_INICIADO
@@ -168,7 +171,7 @@ async def test_message_without_trigger_keyword_is_ignored(msg):
     "manicure",
 ])
 async def test_keyword_triggers_menu_once_with_exact_text(trigger_msg):
-    """Verifica que cualquier keyword (saludo, cita, agenda, o catálogo) dispare el menú exacto."""
+    """Verifica que cualquier keyword dispare el menú con el texto exacto especificado."""
     phone = f"5193333{abs(hash(trigger_msg)) % 10000:04d}"
     sent_messages = []
     with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, m: sent_messages.append(m))):
@@ -181,7 +184,6 @@ async def test_keyword_triggers_menu_once_with_exact_text(trigger_msg):
         )
 
     assert len(sent_messages) == 1
-    # Verificar exactitud del mensaje
     expected_message = (
         "¡Hola! ✨ Bienvenida a Glowlab.\n"
         "Para brindarte una mejor atención, te invitamos a elegir una de las siguientes opciones:\n"
@@ -192,57 +194,84 @@ async def test_keyword_triggers_menu_once_with_exact_text(trigger_msg):
     assert sent_messages[0] == expected_message
     assert svc.INTERACTIVE_MENU_MESSAGE == expected_message
 
-    # Verificar que el estado cambió a 'pendiente_seleccion'
     state = await svc.load_state(phone)
     assert state.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
     assert state.get("session_active") is False
 
 
 # ============================================================
-# 3. MANEJO DE PENDIENTE_SELECCION — SIN INSISTENCIA
+# 3. KEYWORD REPETIDA VARIAS VECES REENVÍA EL MENÚ CADA VEZ
 # ============================================================
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_reply", [
-    "precio",
-    "cuánto cuesta?",
-    "hola de nuevo",
-    "3",
-    "4",
-    "no entiendo",
-    "asesor por favor",
-    "qwerty",
-])
-async def test_pending_selection_ignores_unrecognized_replies_without_resending(invalid_reply):
-    """Verifica que mensajes irrelevantes en 'pendiente_seleccion' no reciban respuesta ni reenvío."""
-    # Ignorar si es variante de opción 2 reconocida
-    if svc.is_menu_option_2(invalid_reply):
-        return
-
-    phone = "51944445555"
-    # Establecer estado en pendiente_seleccion
-    state = {
-        "nombre": "Lucia",
-        "menu_estado": svc.MENU_ESTADO_PENDIENTE,
-        "session_active": False,
-        "last_interaction_at": time.time(),
-    }
-    await svc.save_state(phone, state)
-
+async def test_repeated_keywords_resends_welcome_menu_every_time():
+    """
+    Verifica que mientras no se haya elegido opción (no_iniciado o pendiente_seleccion),
+    cada mensaje con keyword reenvíe el mensaje de bienvenida sin importar cuántas veces se envíe.
+    """
+    phone = "51944441111"
     sent_messages = []
+
     with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, m: sent_messages.append(m))):
+        # 1. Primer trigger: "Hola"
         await handle_client_message(
             sender_number=phone,
             sender_name="Lucia",
-            message_text=invalid_reply,
-            message_data={"conversation": invalid_reply},
+            message_text="Hola",
+            message_data={"conversation": "Hola"},
             raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
         )
+        assert len(sent_messages) == 1
+        assert sent_messages[-1] == svc.INTERACTIVE_MENU_MESSAGE
 
-    # Cero mensajes enviados y el estado sigue en pendiente_seleccion
-    assert len(sent_messages) == 0
-    state_after = await svc.load_state(phone)
-    assert state_after.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
+        state = await svc.load_state(phone)
+        assert state.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
+
+        # 2. Mensaje irrelevante sin keyword -> Silencio (no cambia contador de mensajes enviados)
+        await handle_client_message(
+            sender_number=phone,
+            sender_name="Lucia",
+            message_text="que hiciste en la noche",
+            message_data={"conversation": "que hiciste en la noche"},
+            raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
+        )
+        assert len(sent_messages) == 1
+
+        # 3. Segundo trigger: "quiero una cita" -> Reenvía menú
+        await handle_client_message(
+            sender_number=phone,
+            sender_name="Lucia",
+            message_text="quiero una cita",
+            message_data={"conversation": "quiero una cita"},
+            raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
+        )
+        assert len(sent_messages) == 2
+        assert sent_messages[-1] == svc.INTERACTIVE_MENU_MESSAGE
+
+        # 4. Tercer trigger: "pestañas" -> Reenvía menú
+        await handle_client_message(
+            sender_number=phone,
+            sender_name="Lucia",
+            message_text="pestañas por favor",
+            message_data={"conversation": "pestañas por favor"},
+            raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
+        )
+        assert len(sent_messages) == 3
+        assert sent_messages[-1] == svc.INTERACTIVE_MENU_MESSAGE
+
+        # 5. Cuarto trigger: "cabello" -> Reenvía menú
+        await handle_client_message(
+            sender_number=phone,
+            sender_name="Lucia",
+            message_text="tratamiento para el cabello",
+            message_data={"conversation": "tratamiento para el cabello"},
+            raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
+        )
+        assert len(sent_messages) == 4
+        assert sent_messages[-1] == svc.INTERACTIVE_MENU_MESSAGE
+
+        state_final = await svc.load_state(phone)
+        assert state_final.get("menu_estado") == svc.MENU_ESTADO_PENDIENTE
 
 
 # ============================================================
@@ -295,7 +324,7 @@ async def test_option_1_activates_asistente_virtual_and_agent(opt1_text):
 
 
 # ============================================================
-# 5. OPCIÓN 2 ACTIVA ATENCIÓN PERSONALIZADA Y GUARDA SILENCIO
+# 5. OPCIÓN 2 ACTIVA ATENCIÓN PERSONALIZADA Y SILENCIO TOTAL
 # ============================================================
 
 @pytest.mark.asyncio
@@ -309,8 +338,8 @@ async def test_option_1_activates_asistente_virtual_and_agent(opt1_text):
     "atencion personalizada",
     "atención personalizada",
 ])
-async def test_option_2_activates_atencion_personalizada_and_silences_bot(opt2_text):
-    """Verifica que la opción 2 envíe 1 mensaje de confirmación y luego el bot guarde silencio total."""
+async def test_option_2_activates_atencion_personalizada_and_silences_bot_even_with_keywords(opt2_text):
+    """Verifica que la opción 2 envíe 1 mensaje y luego el bot guarde silencio total incluso ante keywords."""
     phone = f"5196666{abs(hash(opt2_text)) % 10000:04d}"
     state = {
         "nombre": "Sofia",
@@ -340,7 +369,7 @@ async def test_option_2_activates_atencion_personalizada_and_silences_bot(opt2_t
     assert state_after.get("session_active") is False
     assert state_after.get("atencion_personalizada_at") is not None
 
-    # 2. Mensajes subsiguientes de la clienta en este estado deben ser COMPLETAMENTE IGNORADOS (Silencio total)
+    # 2. Mensajes subsiguientes con keywords deben ser TOTALMENTE IGNORADOS (Silencio total)
     sent_subsequent = []
     with (
         patch("app.modules.salon.services.run_conversational_agent", new=AsyncMock()) as mock_agent,
@@ -356,8 +385,15 @@ async def test_option_2_activates_atencion_personalizada_and_silences_bot(opt2_t
         await handle_client_message(
             sender_number=phone,
             sender_name="Sofia",
-            message_text="quiero hacerme pestañas hoy",
-            message_data={"conversation": "quiero hacerme pestañas hoy"},
+            message_text="quiero hacerme pestañas hoy y agendar cita",
+            message_data={"conversation": "quiero hacerme pestañas hoy y agendar cita"},
+            raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
+        )
+        await handle_client_message(
+            sender_number=phone,
+            sender_name="Sofia",
+            message_text="1",
+            message_data={"conversation": "1"},
             raw_item={"key": {"remoteJid": f"{phone}@s.whatsapp.net"}},
         )
 

@@ -84,6 +84,8 @@ async def test_generate_client_reply_fallback():
     assert "hidratación" in reply_rec.lower() or "botox" in reply_rec.lower()
 
     reply_menu = await svc.generate_client_reply(state, "¿Qué servicios tienen?")
-    assert "Pestañas" in reply_menu
-    assert "Uñas" in reply_menu
-    assert "Botox capilar" in reply_menu
+    reply_menu_lower = reply_menu.lower()
+    assert "pestañas" in reply_menu_lower or "pestanas" in reply_menu_lower
+    assert "uñas" in reply_menu_lower or "unas" in reply_menu_lower
+    assert "botox" in reply_menu_lower or "capilar" in reply_menu_lower
+

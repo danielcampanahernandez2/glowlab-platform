@@ -110,25 +110,10 @@ async def handle_client_message(
                 logger.info(f"🔇 [SILENCIO TOTAL] Mensaje de +{phone_norm} ignorado en 'atencion_personalizada': '{clean_text}'")
                 return
 
-            # 4. ESTADO: no_iniciado -> Trigger selectivo por keywords (hola, cita, agenda, catálogo)
-            if menu_estado == svc.MENU_ESTADO_NO_INICIADO:
-                if svc.is_menu_trigger_keyword(clean_text):
-                    state["menu_estado"] = svc.MENU_ESTADO_PENDIENTE
-                    state["menu_displayed"] = True
-                    state["session_active"] = False
-                    state["last_interaction_at"] = time.time()
-                    await svc.save_state(phone_norm, state, tenant_id=tenant_id)
-                    await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
-                    return
-                else:
-                    # Sin match: bot no responde nada y menu_estado se mantiene en no_iniciado
-                    logger.info(f"🔇 [NO INICIADO] Mensaje sin keyword de +{phone_norm} ignorado: '{clean_text}'")
-                    return
-
-            # 5. ESTADO: pendiente_seleccion -> Manejo sin insistencia
-            if menu_estado == svc.MENU_ESTADO_PENDIENTE:
+            # 4. ESTADOS PREVIOS A LA SELECCIÓN: no_iniciado O pendiente_seleccion
+            if menu_estado in (svc.MENU_ESTADO_NO_INICIADO, svc.MENU_ESTADO_PENDIENTE):
+                # A) Opción 1: Asistente virtual (OpenAI toma el control)
                 if svc.is_menu_option_1(clean_text):
-                    # Opción 1: Asistente virtual (OpenAI toma el control)
                     state["menu_estado"] = svc.MENU_ESTADO_ASISTENTE
                     await svc.activate_ai_session(phone_norm, state, tenant_id=tenant_id)
                     reply = await svc.run_conversational_agent(
@@ -143,8 +128,8 @@ async def handle_client_message(
                         await svc.send_message(phone_norm, reply)
                     return
 
+                # B) Opción 2: Atención personalizada (Asesor humano)
                 elif svc.is_menu_option_2(clean_text):
-                    # Opción 2: Atención personalizada (Asesor humano)
                     state["menu_estado"] = svc.MENU_ESTADO_ATENCION_PERSONALIZADA
                     state["atencion_personalizada_at"] = time.time()
                     await svc.deactivate_ai_session(phone_norm, state, tenant_id=tenant_id, paso="derivada")
@@ -155,10 +140,21 @@ async def handle_client_message(
                     )
                     return
 
-                else:
-                    # Mensaje no coincide con 1 ni 2 -> No responder nada, no reenviar menú, mantener pendiente_seleccion
-                    logger.info(f"🔇 [PENDIENTE SELECCIÓN] Mensaje no reconocido de +{phone_norm} ignorado sin insistir: '{clean_text}'")
+                # C) Si el mensaje contiene alguna keyword (hola, cita, agenda, catálogo): reenvía el menú cada vez
+                elif svc.is_menu_trigger_keyword(clean_text):
+                    state["menu_estado"] = svc.MENU_ESTADO_PENDIENTE
+                    state["menu_displayed"] = True
+                    state["session_active"] = False
+                    state["last_interaction_at"] = time.time()
+                    await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+                    await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
                     return
+
+                # D) Mensaje sin keyword y sin opción 1/2: Silencio total
+                else:
+                    logger.info(f"🔇 [SIN COINCIDENCIA] Mensaje sin keyword ni opción de +{phone_norm} ignorado en estado {menu_estado}: '{clean_text}'")
+                    return
+
 
             # 6. ESTADO: asistente_virtual -> Flujo normal del agente conversacional
             if menu_estado == svc.MENU_ESTADO_ASISTENTE:
