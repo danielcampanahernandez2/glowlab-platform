@@ -134,9 +134,11 @@ async def handle_client_message(
                     state["atencion_personalizada_at"] = time.time()
                     await svc.deactivate_ai_session(phone_norm, state, tenant_id=tenant_id, paso="derivada")
                     await svc.send_message(phone_norm, svc.HUMAN_ADVISOR_CONFIRMATION_MESSAGE)
-                    await svc.notify_all_staff(
-                        f"🔔 [{tenant_id}] Clienta +{phone_norm} ({state.get('nombre', sender_name)}) "
-                        f"ha solicitado atención personalizada con una asesora (Opción 2)."
+                    await svc.notify_atencion_personalizada_event(
+                        phone=phone_norm,
+                        nombre=state.get("nombre", sender_name),
+                        wait_time_str="ahora",
+                        tenant_id=tenant_id,
                     )
                     return
 
@@ -234,13 +236,24 @@ async def _handle_voucher_step(
         if valid:
             # Confirmar la cita
             state["adelanto_validado"] = True
-            if state.get("cita_id"):
+            cita_id = state.get("cita_id")
+            if cita_id:
                 await svc.update_cita_estado(
-                    db, state["cita_id"], "confirmada", tenant_id=tenant_id, adelanto_pagado=True
+                    db, cita_id, "confirmada", tenant_id=tenant_id, adelanto_pagado=True
                 )
 
             asesora = state.get("asesora", "lizbeth")
-            await svc.notify_advisor(asesora, svc.build_staff_notification(state, sender_number))
+            await svc.notify_cita_confirmed_event(
+                cita_id=cita_id or 0,
+                cliente_nombre=state.get("nombre") or "Clienta",
+                cliente_phone=sender_number,
+                servicio=state.get("servicio", "Servicio"),
+                fecha=state.get("fecha", ""),
+                hora=state.get("hora", ""),
+                asesora=asesora,
+                origen="Voucher WhatsApp",
+                tenant_id=tenant_id,
+            )
 
             state["paso"] = "cita_confirmada"
             # Apagado automático de la sesión de IA tras confirmación exitosa de cita
@@ -248,6 +261,14 @@ async def _handle_voucher_step(
             await svc.send_message(sender_number, svc.build_confirmation_message(state))
 
         else:
+            # Notificar al self-chat / staff sobre comprobante dudoso
+            await svc.notify_voucher_unclear_event(
+                phone=sender_number,
+                nombre=state.get("nombre", "Clienta"),
+                reason=reason or "Comprobante no legible o monto dudoso",
+                tenant_id=tenant_id,
+            )
+
             # Voucher inválido: reintento o derivar
             intentos = state.get("intentos_voucher", 0) + 1
             state["intentos_voucher"] = intentos
@@ -255,10 +276,6 @@ async def _handle_voucher_step(
             if intentos >= 3:
                 state["paso"] = "derivada"
                 await svc.deactivate_ai_session(sender_number, state, tenant_id=tenant_id, paso="derivada")
-                await svc.notify_all_staff(
-                    f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
-                    f"tuvo problemas con el comprobante. Verificar manualmente."
-                )
                 await svc.send_message(
                     sender_number,
                     "No pudimos verificar el comprobante. Una asesora te contactará para ayudarte. 🌸"
@@ -287,7 +304,7 @@ async def _handle_voucher_step(
 async def process_webhook_payload(payload: Dict[str, Any]) -> None:
     """
     Enruta cada mensaje entrante resolviendo el tenant a partir de la instancia de Evolution API.
-    Aísla las consultas, staff, y estados conversacionales por cada negocio.
+    Aísla las consultas, staff, self-chat y estados conversacionales por cada negocio.
     """
     try:
         instance_name = (
@@ -337,8 +354,6 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
             key = item.get("key", {})
             if not isinstance(key, dict):
                 continue
-            if key.get("fromMe", False):
-                continue
 
             remote_jid = key.get("remoteJid", "")
             if not remote_jid or remote_jid == "status@broadcast" or "@g.us" in remote_jid:
@@ -349,6 +364,15 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
             raw_sender = remote_jid.split("@")[0].split(":")[0]
             sender_number = svc.normalize_phone(raw_sender)
             sender_name = item.get("pushName", "") or ""
+
+            # Detección de Self-Chat vs Outgoing a Cliente:
+            # Si sender_number está en staff_dict -> Es la trabajadora (self-chat o comando directo)
+            # Si fromMe es True y sender_number NO está en staff_dict -> Es un mensaje saliente a una clienta (ignorar)
+            is_from_me = key.get("fromMe", False)
+            is_staff_sender = sender_number in staff_dict
+
+            if is_from_me and not is_staff_sender:
+                continue
 
             message_data: Dict[str, Any] = item.get("message", {}) or {}
 
@@ -369,13 +393,14 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
                 continue
 
             # ── Enrutamiento por rol y tenant ──
-            if sender_number in staff_dict:
+            if is_staff_sender:
                 staff_name = staff_dict[sender_number]
                 await handle_staff_message(sender_number, staff_name, message_text, tenant_id=tenant_id)
             else:
                 await handle_client_message(
                     sender_number, sender_name, message_text, message_data, item, tenant_id=tenant_id
                 )
+
 
     except Exception as e:
         logger.error(f"Error procesando payload del webhook: {e}", exc_info=True)

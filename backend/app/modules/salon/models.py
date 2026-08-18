@@ -155,6 +155,8 @@ class Cita(Base):
     # Control de recordatorios y seguimiento
     recordatorio_24h_enviado = Column(Boolean, default=False)
     recordatorio_2h_enviado = Column(Boolean, default=False)
+    recordatorio_staff_2h_enviado = Column(Boolean, default=False, nullable=False, index=True)
+    alerta_noshow_enviada = Column(Boolean, default=False, nullable=False, index=True)
     seguimiento_enviado = Column(Boolean, default=False)
     post_service_sent = Column(Boolean, default=False, nullable=False, index=True)
     post_service_pending_morning = Column(Boolean, default=False, nullable=False)
@@ -162,6 +164,7 @@ class Cita(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 
 class ServiceFollowup(Base):

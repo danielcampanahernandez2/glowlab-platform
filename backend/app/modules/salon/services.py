@@ -834,6 +834,13 @@ async def _check_monthly_budget_alert(tenant_id: str = "glowlab") -> None:
                 except Exception:
                     pass
 
+                # Notificación urgente al self-chat / staff
+                try:
+                    await notify_budget_limit_event(float(total_month_usd), float(budget_limit), tenant_id=tenant_id)
+                except Exception as e:
+                    logger.debug(f"Error enviando notificación de presupuesto al staff: {e}")
+
+
     except Exception as e:
         logger.debug(f"Error verificando cuota y presupuesto mensual ({tenant_id}): {e}")
 
@@ -2156,7 +2163,12 @@ async def run_conversational_agent(
                 reason=fallback_reason,
                 exception=fallback_exception,
             )
+            try:
+                await notify_bot_fallback_event(fallback_reason, tenant_id=tenant_id)
+            except Exception as e:
+                logger.debug(f"Error enviando alerta de fallback al staff: {e}")
         final_reply = _fallback_client_reply(state, message_text)
+
 
     _record_history(state, message_text, final_reply)
     await save_state(phone_norm, state, tenant_id=tenant_id)
@@ -2463,6 +2475,203 @@ async def notify_all_staff(text: str) -> None:
     """Envía una notificación a todas las asesoras del equipo."""
     for phone in STAFF_PHONES.values():
         await send_message(phone, text)
+
+
+def is_within_staff_silence_window(dt: Optional[datetime] = None) -> bool:
+    """
+    Verifica si la hora actual en zona horaria America/Lima está dentro de la ventana permitida
+    para notificaciones no urgentes de staff (08:00 a 21:00 hora Perú).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Lima")
+    except Exception:
+        from datetime import timezone
+        tz = timezone(timedelta(hours=-5))
+
+    now_local = datetime.now(tz) if dt is None else (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc).astimezone(tz))
+    return 8 <= now_local.hour < 21
+
+
+async def send_staff_notification(
+    text: str, urgent: bool = False, tenant_id: str = "glowlab"
+) -> bool:
+    """
+    Envía una notificación al self-chat / números de staff respetando la ventana de silencio (8am-9pm Perú).
+    - Si urgent=True: Se despacha inmediatamente 24/7 (fallos críticos, bot caído, alertas presupuesto).
+    - Si urgent=False: Si está dentro de 8am-9pm se envía inmediatamente; si no, se encola en Redis
+      para ser despachada a las 8:00 AM (inicio de jornada).
+    """
+    if urgent or is_within_staff_silence_window():
+        await notify_all_staff(text)
+        return True
+    else:
+        # Encolar en Redis
+        try:
+            r = await _get_redis()
+            if r:
+                q_key = f"glowlab:pending_staff_notifications:{tenant_id}"
+                await r.rpush(q_key, text)
+                logger.info(f"🌙 [VENTANA DE SILENCIO] Notificación staff encolada para las 8:00 AM: {text[:60]}...")
+                return True
+        except Exception as e:
+            logger.debug(f"No se pudo encolar en Redis, enviando directo: {e}")
+            await notify_all_staff(text)
+            return True
+    return False
+
+
+async def flush_pending_staff_notifications(tenant_id: str = "glowlab") -> int:
+    """Despacha todas las notificaciones de staff acumuladas en la cola de la ventana de silencio nocturna."""
+    count = 0
+    try:
+        r = await _get_redis()
+        if not r:
+            return 0
+        q_key = f"glowlab:pending_staff_notifications:{tenant_id}"
+        while True:
+            item = await r.lpop(q_key)
+            if not item:
+                break
+            msg_text = item.decode("utf-8") if isinstance(item, bytes) else str(item)
+            await notify_all_staff(f"🌅 *Notificación acumulada de la noche:*\n\n{msg_text}")
+            count += 1
+    except Exception as e:
+        logger.error(f"Error vaciando notificaciones pendientes de staff: {e}")
+    return count
+
+
+# ── HELPERS DE EVENTOS DE NOTIFICACIÓN AUTOMÁTICA AL SELF-CHAT ──
+
+async def notify_cita_confirmed_event(
+    cita_id: int,
+    cliente_nombre: str,
+    cliente_phone: str,
+    servicio: str,
+    fecha: str,
+    hora: str,
+    asesora: Optional[str] = None,
+    origen: str = "Bot WhatsApp",
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 1: Cita confirmada/agendada (por cliente o staff)."""
+    f_dt = parse_fecha(fecha) if fecha else None
+    f_str = format_fecha_es(f_dt) if f_dt else fecha
+    h_str = format_hora_12h(hora) if hora else hora
+    text = (
+        f"📅 *Nueva Cita Confirmada — Glowlab*\n\n"
+        f"🆔 Cita #{cita_id}\n"
+        f"👤 Clienta: {cliente_nombre or 'Sin nombre'} (📱 +{cliente_phone})\n"
+        f"💇‍♀️ Servicio: {servicio}\n"
+        f"📆 Fecha: {f_str}\n"
+        f"⏰ Hora: {h_str}\n"
+        f"👩‍🦰 Asesora: {asesora or 'Por asignar'}\n"
+        f"💰 Adelanto: Confirmado ✅\n"
+        f"💡 Origen: {origen}"
+    )
+    await send_staff_notification(text, urgent=False, tenant_id=tenant_id)
+
+
+async def notify_atencion_personalizada_event(
+    phone: str,
+    nombre: str,
+    wait_time_str: str = "ahora",
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 2: Clienta selecciona opción 2 (atención personalizada)."""
+    text = (
+        f"🔔 *Solicitud de Atención Personalizada (Opción 2)*\n\n"
+        f"👤 Clienta: {nombre or 'Sin nombre'} (📱 +{phone})\n"
+        f"⏳ Esperando atención desde: *{wait_time_str}*\n\n"
+        f"💬 _El bot se encuentra en silencio. Por favor responde directamente a la clienta para continuar._"
+    )
+    await send_staff_notification(text, urgent=False, tenant_id=tenant_id)
+
+
+async def notify_cita_cancelled_event(
+    cita_id: int,
+    cliente_nombre: str,
+    cliente_phone: str,
+    servicio: str,
+    fecha: str,
+    hora: str,
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 3 y 8: Cancelación de cita por la clienta y horario liberado."""
+    f_dt = parse_fecha(fecha) if fecha else None
+    f_str = format_fecha_es(f_dt) if f_dt else fecha
+    h_str = format_hora_12h(hora) if hora else hora
+    text = (
+        f"❌ *Cita Cancelada por la Clienta*\n\n"
+        f"🆔 Cita #{cita_id}\n"
+        f"👤 Clienta: {cliente_nombre or 'Sin nombre'} (📱 +{cliente_phone})\n"
+        f"💇‍♀️ Servicio: {servicio}\n"
+        f"📆 Horario liberado: *{f_str} a las {h_str}*\n\n"
+        f"🔓 *Horario disponible para reasignación.*"
+    )
+    await send_staff_notification(text, urgent=False, tenant_id=tenant_id)
+
+
+async def notify_voucher_unclear_event(
+    phone: str,
+    nombre: str,
+    reason: str,
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 4: Comprobante que el OCR no pudo validar con certeza."""
+    text = (
+        f"📸 *Comprobante Requiere Revisión Manual*\n\n"
+        f"👤 Clienta: {nombre or 'Sin nombre'} (📱 +{phone})\n"
+        f"⚠️ Motivo: {reason}\n"
+        f"🔍 Por favor revisa la imagen en el chat de WhatsApp antes de confirmar la cita."
+    )
+    await send_staff_notification(text, urgent=False, tenant_id=tenant_id)
+
+
+async def notify_bot_fallback_event(
+    reason: str,
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 5: Bot entra en modo fallback por fallo en IA (Urgente 24/7)."""
+    text = (
+        f"🚨 *ALERTA URGENTE: Bot en Modo Fallback*\n\n"
+        f"El agente de OpenAI ha presentado fallas consecutivas y el bot ha activado el motor determinista de contingencia.\n"
+        f"⚠️ Detalle: {reason[:120]}\n"
+        f"🛠️ Revisa la cuenta de OpenAI / créditos para restablecer el servicio normal."
+    )
+    await send_staff_notification(text, urgent=True, tenant_id=tenant_id)
+
+
+async def notify_budget_limit_event(
+    spent_usd: float,
+    limit_usd: float,
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 6: Presupuesto mensual de OpenAI cerca del límite (Urgente 24/7)."""
+    text = (
+        f"⚠️ *ALERTA URGENTE: Presupuesto OpenAI Próximo al Límite*\n\n"
+        f"El gasto mensual acumulado de OpenAI ha alcanzado *${spent_usd:.2f} USD* "
+        f"(Límite configurado: *${limit_usd:.2f} USD*).\n"
+        f"💡 Monitorea el consumo para evitar interrupciones en el servicio."
+    )
+    await send_staff_notification(text, urgent=True, tenant_id=tenant_id)
+
+
+async def notify_unattended_client_event(
+    phone: str,
+    nombre: str,
+    wait_minutes: int,
+    tenant_id: str = "glowlab",
+) -> None:
+    """Evento 7: Clienta en atención personalizada sin respuesta por > 30-60 min."""
+    text = (
+        f"⏰ *Recordatorio: Clienta en Espera Sin Respuesta*\n\n"
+        f"👤 Clienta: *{nombre or 'Sin nombre'}* (📱 +{phone})\n"
+        f"⏳ Lleva *{wait_minutes} minutos* esperando atención personalizada de una asesora.\n"
+        f"✨ Por favor responde su mensaje para no dejarla esperando."
+    )
+    await send_staff_notification(text, urgent=False, tenant_id=tenant_id)
+
 
 
 # ============================================================
@@ -3274,6 +3483,174 @@ async def move_staff_cita(staff_name: str, staff_phone: str, query: str, tenant_
     )
 
 
+async def find_client_by_query(
+    query: str, tenant_id: str = "glowlab"
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Busca a un cliente por número de teléfono (dígitos) o nombre dentro de la base de datos (Cliente y Cita).
+    Retorna: (phone_norm, client_name, error_or_disambiguation_message)
+    - Si encuentra exactamente 1: retorna (phone, name, None)
+    - Si no encuentra ninguno: retorna (None, None, "❌ No encontré ningún cliente...")
+    - Si encuentra múltiples: retorna (None, None, "⚠️ Encontré X clientes... [lista para desambiguar]")
+    """
+    clean_q = query.strip()
+    if not clean_q:
+        return None, None, "❌ Debes especificar un número de teléfono o nombre de cliente."
+
+    digits = re.sub(r"\D", "", clean_q)
+    # Si la búsqueda contiene 7 o más dígitos, se interpreta como número de teléfono
+    if len(digits) >= 7:
+        phone_norm = normalize_phone(digits)
+        client_name = "Clienta"
+        try:
+            async with async_session_factory() as db:
+                res = await db.execute(
+                    select(Cliente).where(
+                        Cliente.tenant_id == tenant_id,
+                        Cliente.phone == phone_norm,
+                    )
+                )
+                cl = res.scalar_one_or_none()
+                if cl and hasattr(cl, "nombre") and isinstance(cl.nombre, str) and cl.nombre:
+                    client_name = cl.nombre
+                else:
+                    res_c = await db.execute(
+                        select(Cita.cliente_nombre).where(
+                            Cita.tenant_id == tenant_id,
+                            Cita.cliente_phone == phone_norm,
+                        ).order_by(Cita.id.desc()).limit(1)
+                    )
+                    c_name = res_c.scalar()
+                    if c_name and isinstance(c_name, str):
+                        client_name = c_name
+        except Exception as err:
+            logger.debug(f"Error consultando nombre para +{phone_norm}: {err}")
+
+        return phone_norm, client_name, None
+
+    # Búsqueda por nombre de texto
+    try:
+        async with async_session_factory() as db:
+            # 1. Buscar en Cliente
+            res = await db.execute(
+                select(Cliente).where(
+                    Cliente.tenant_id == tenant_id,
+                    Cliente.nombre.ilike(f"%{clean_q}%")
+                )
+            )
+            clientes = res.scalars().all()
+
+            found_dict: Dict[str, str] = {}
+            for cl in clientes:
+                if cl and hasattr(cl, "phone") and cl.phone and isinstance(cl.phone, str):
+                    c_n = cl.nombre if (hasattr(cl, "nombre") and isinstance(cl.nombre, str)) else "Clienta"
+                    found_dict[normalize_phone(cl.phone)] = c_n
+
+            # 2. Buscar en Cita por cliente_nombre
+            res_citas = await db.execute(
+                select(Cita.cliente_phone, Cita.cliente_nombre).where(
+                    Cita.tenant_id == tenant_id,
+                    Cita.cliente_nombre.ilike(f"%{clean_q}%")
+                ).distinct()
+            )
+            for c_phone, c_name in res_citas.all():
+                if c_phone and isinstance(c_phone, str):
+                    p_norm = normalize_phone(c_phone)
+                    if p_norm not in found_dict:
+                        found_dict[p_norm] = c_name if (c_name and isinstance(c_name, str)) else "Clienta"
+
+        if len(found_dict) == 0:
+            return None, None, f"❌ No encontré ningún cliente con el criterio: *'{clean_q}'*."
+        elif len(found_dict) == 1:
+            phone_norm, name = next(iter(found_dict.items()))
+            return phone_norm, name, None
+        else:
+            lines = [
+                f"⚠️ *Encontré {len(found_dict)} clientes que coinciden con '{clean_q}':*",
+                "Por favor especifica indicando el número exacto:\n"
+            ]
+            for p, n in found_dict.items():
+                lines.append(f"• *{n}* (📱 `+{p}`)")
+            lines.append(f"\n👉 Ejemplo: `activar bot {list(found_dict.keys())[0]}` o `liberar bot {list(found_dict.keys())[0]}`")
+            return None, None, "\n".join(lines)
+
+    except Exception as err:
+        logger.error(f"Error buscando cliente por '{clean_q}': {err}")
+        return None, None, f"⚠️ Error al buscar cliente: {err}"
+
+
+
+async def activate_staff_bot(staff_name: str, staff_phone: str, query: str, tenant_id: str = "glowlab") -> str:
+    """
+    Comando de staff: 'activar bot <numero o nombre>'.
+    Cambia menu_estado a 'asistente_virtual' directamente, activa la sesión de IA
+    y envía confirmación al staff y opcionalmente a la clienta.
+    """
+    target_phone, client_name, err_msg = await find_client_by_query(query, tenant_id=tenant_id)
+    if err_msg:
+        return err_msg
+
+    async with phone_distributed_lock(target_phone, tenant_id=tenant_id):
+        state = await load_state(target_phone, tenant_id=tenant_id)
+        state["menu_estado"] = MENU_ESTADO_ASISTENTE
+        state["session_active"] = True
+        state["paso"] = "asistente_ia"
+        state["nombre"] = client_name
+        state["last_interaction_at"] = time.time()
+        state.pop("atencion_personalizada_at", None)
+        await save_state(target_phone, state, tenant_id=tenant_id)
+
+    # Mensaje a la clienta
+    client_notice = (
+        f"¡Hola {client_name}! 🌸 A partir de ahora puedo ayudarte por aquí con tus consultas y citas. ✨"
+    )
+    try:
+        await send_message(target_phone, client_notice)
+    except Exception as err:
+        logger.warning(f"No se pudo enviar notificación de activación a la clienta +{target_phone}: {err}")
+
+    logger.info(f"🤖 [STAFF COMMAND] {staff_name} ({staff_phone}) activó el bot para +{target_phone} ({client_name})")
+    return (
+        f"✅ *Bot activado para +{target_phone} ({client_name})*\n\n"
+        f"El estado ahora es *asistente_virtual*. El agente conversacional responderá directamente sus mensajes."
+    )
+
+
+async def release_staff_bot(staff_name: str, staff_phone: str, query: str, tenant_id: str = "glowlab") -> str:
+    """
+    Comando de staff: 'liberar bot <numero o nombre>'.
+    Resetea menu_estado a 'no_iniciado', apaga la sesión y limpia el estado.
+    """
+    target_phone, client_name, err_msg = await find_client_by_query(query, tenant_id=tenant_id)
+    if err_msg:
+        return err_msg
+
+    async with phone_distributed_lock(target_phone, tenant_id=tenant_id):
+        await clear_state(target_phone, tenant_id=tenant_id)
+        state = {
+            "nombre": client_name,
+            "menu_estado": MENU_ESTADO_NO_INICIADO,
+            "session_active": False,
+            "paso": "inicial",
+            "menu_displayed": False,
+            "last_interaction_at": time.time(),
+        }
+        await save_state(target_phone, state, tenant_id=tenant_id)
+
+        try:
+            r = await _get_redis()
+            if r:
+                await r.delete(f"tenant:{tenant_id}:session:{target_phone}")
+        except Exception:
+            pass
+
+    logger.info(f"🤖 [STAFF COMMAND] {staff_name} ({staff_phone}) liberó el bot para +{target_phone} ({client_name})")
+    return (
+        f"✅ *Bot liberado para +{target_phone} ({client_name})*\n\n"
+        f"El estado volvió a *no_iniciado*. El menú interactivo volverá a activarse ante nuevos mensajes."
+    )
+
+
 def get_staff_help(staff_name: str) -> str:
     """Devuelve el manual interactivo de comandos para el equipo."""
     return (
@@ -3289,8 +3666,9 @@ def get_staff_help(staff_name: str) -> str:
         f"🔄 *Mover / Reprogramar Cita:*\n"
         f"• `mover cita <ID> a <fecha y hora>` → Ej: _mover cita 12 a mañana 4pm_\n"
         f"• `mover cita <Nombre> a <fecha y hora>` → Ej: _mover cita Valeria a viernes 11am_\n\n"
-        f"🤖 *Control del Bot:*\n"
-        f"• `liberar bot <numero>` → Resetea el menú inicial para un cliente (ej: _liberar bot 992509246_)\n\n"
+        f"🤖 *Control del Asistente Virtual:*\n"
+        f"• `activar bot <numero o nombre>` → Activa el asistente virtual directamente para el cliente (ej: _activar bot 992509246_ o _activar bot Maria_)\n"
+        f"• `liberar bot <numero o nombre>` → Resetea el menú inicial para el cliente (ej: _liberar bot 992509246_ o _liberar bot Maria_)\n\n"
         f"💰 *Gasto y Consumo de IA (OpenAI):*\n"
         f"• `costo openai hoy` → Consumo de tokens y costo acumulado hoy\n"
         f"• `costo openai mes` → Consumo de tokens y costo acumulado del mes\n\n"
@@ -3306,6 +3684,7 @@ async def execute_staff_command(
 ) -> str:
     """
     Parser determinista de comandos para gestión de agenda por parte del Staff asociado al tenant.
+    Soporta operaciones desde cualquier chat de staff o canal self-chat.
     """
     raw = message.strip()
     s = raw.lower()
@@ -3350,31 +3729,265 @@ async def execute_staff_command(
         else:
             return await get_openai_cost_report(timeframe="hoy", tenant_id=tenant_id)
 
-    # 5. Liberar / Activar / Reset Bot para un número (liberar bot <numero>, activar bot <numero>, reset bot <numero>)
-    bot_match = re.match(r'^(?:liberar\s+bot|activar\s+bot|reset\s+bot|habilitar\s+bot)\s+(.+)$', s)
-    if bot_match:
-        target_raw = bot_match.group(1).strip()
-        target_phone = normalize_phone(target_raw)
-        async with phone_distributed_lock(target_phone, tenant_id=tenant_id):
-            client_state = await load_state(target_phone, tenant_id=tenant_id)
-            client_state["menu_estado"] = MENU_ESTADO_NO_INICIADO
-            client_state["session_active"] = False
-            client_state["paso"] = "inicial"
-            client_state["menu_displayed"] = False
-            client_state.pop("atencion_personalizada_at", None)
-            await save_state(target_phone, client_state, tenant_id=tenant_id)
+    # 5. Activar Bot para un cliente (activar bot <numero/nombre>, activar <numero/nombre>)
+    act_match = re.match(r'^(?:activar\s+bot|activar|habilitar\s+bot)\s+(.+)$', s)
+    if act_match:
+        query = act_match.group(1).strip()
+        return await activate_staff_bot(staff_name, staff_phone, query, tenant_id=tenant_id)
 
-            try:
-                r = await _get_redis()
-                if r:
-                    await r.delete(f"tenant:{tenant_id}:session:{target_phone}")
-            except Exception:
-                pass
+    # 6. Liberar / Reset Bot para un cliente (liberar bot <numero/nombre>, reset bot <numero/nombre>, desbloquear bot <numero/nombre>)
+    rel_match = re.match(r'^(?:liberar\s+bot|liberar|reset\s+bot|reset|desbloquear\s+bot|desbloquear)\s+(.+)$', s)
+    if rel_match:
+        query = rel_match.group(1).strip()
+        return await release_staff_bot(staff_name, staff_phone, query, tenant_id=tenant_id)
 
-        logger.info(f"🤖 [STAFF COMMAND] {staff_name} ({staff_phone}) liberó el bot para +{target_phone} (menu_estado -> no_iniciado)")
-        return f"✅ Bot liberado para el número +{target_phone}. El menú inicial volverá a activarse ante nuevos mensajes."
-
-    # 6. Ayuda / Comandos no reconocidos
+    # 7. Ayuda / Comandos no reconocidos
     return get_staff_help(staff_name)
+
+
+# ============================================================
+# TAREAS PROGRAMADAS Y RECORDATORIOS (APScheduler)
+# ============================================================
+
+async def run_staff_2h_reminder_scan() -> None:
+    """
+    Scan periódico de APScheduler que envía recordatorios a las trabajadoras 2h antes de cada cita confirmada.
+    Usa UPDATE atómico para evitar duplicados.
+    """
+    try:
+        from sqlalchemy import text
+        now = datetime.utcnow()
+        today_str = now.strftime("%Y-%m-%d")
+        target_hora = (now + timedelta(hours=2)).strftime("%H:00")
+
+        async with async_session_factory() as db:
+            stmt = text("""
+                UPDATE citas
+                SET recordatorio_staff_2h_enviado = TRUE,
+                    updated_at = :now
+                WHERE id IN (
+                    SELECT id FROM citas
+                    WHERE fecha = :fecha
+                      AND hora = :hora
+                      AND estado = 'confirmada'
+                      AND recordatorio_staff_2h_enviado = FALSE
+                    LIMIT 20
+                )
+                RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
+            """)
+            res = await db.execute(stmt, {"fecha": today_str, "hora": target_hora, "now": now})
+            rows = res.fetchall()
+            await db.commit()
+
+            for row in rows:
+                c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
+                f_dt = parse_fecha(c_fec) if c_fec else None
+                f_str = format_fecha_es(f_dt) if f_dt else c_fec
+                h_str = format_hora_12h(c_hor) if c_hor else c_hor
+                msg = (
+                    f"⏰ *Recordatorio de Cita en 2 horas — Glowlab*\n\n"
+                    f"🆔 Cita #{c_id}\n"
+                    f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
+                    f"💇‍♀️ Servicio: {c_srv}\n"
+                    f"📆 Fecha: {f_str}\n"
+                    f"🕒 Hora: {h_str}\n"
+                    f"👩‍🦰 Asesora: {c_ase or 'Equipo Glowlab'}"
+                )
+                await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
+                logger.info(f"⏰ Recordatorio 2h enviado a staff para Cita #{c_id}")
+    except Exception as e:
+        logger.error(f"Error en run_staff_2h_reminder_scan: {e}", exc_info=True)
+
+
+async def run_noshow_alert_scan() -> None:
+    """
+    Scan periódico de APScheduler que detecta citas confirmadas cuya hora programada
+    ya pasó hace más de 30 minutos sin haber sido completadas ni canceladas.
+    Usa UPDATE atómico para alertar a la trabajadora solo una vez.
+    """
+    try:
+        from sqlalchemy import text
+        now = datetime.utcnow()
+        today_str = now.strftime("%Y-%m-%d")
+        current_time_minus_30m = (now - timedelta(minutes=30)).strftime("%H:%M")
+
+        async with async_session_factory() as db:
+            stmt = text("""
+                UPDATE citas
+                SET alerta_noshow_enviada = TRUE,
+                    updated_at = :now
+                WHERE id IN (
+                    SELECT id FROM citas
+                    WHERE fecha = :fecha
+                      AND hora <= :hora_limite
+                      AND estado = 'confirmada'
+                      AND alerta_noshow_enviada = FALSE
+                    LIMIT 20
+                )
+                RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
+            """)
+            res = await db.execute(stmt, {"fecha": today_str, "hora_limite": current_time_minus_30m, "now": now})
+            rows = res.fetchall()
+            await db.commit()
+
+            for row in rows:
+                c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
+                h_str = format_hora_12h(c_hor) if c_hor else c_hor
+                msg = (
+                    f"⚠️ *Alerta de Posible No-Show / Cita Pendiente*\n\n"
+                    f"🆔 Cita #{c_id}\n"
+                    f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
+                    f"💇‍♀️ Servicio: {c_srv}\n"
+                    f"🕒 Hora programada: {h_str}\n\n"
+                    f"💡 _Si la clienta asistió, marca la cita como completada. Si no se presentó, puedes cancelarla o reprogramarla usando:_ `cancelar cita {c_id}`"
+                )
+                await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
+                logger.info(f"⚠️ Alerta no-show enviada a staff para Cita #{c_id}")
+    except Exception as e:
+        logger.error(f"Error en run_noshow_alert_scan: {e}", exc_info=True)
+
+
+async def run_unattended_atencion_personalizada_scan() -> None:
+    """
+    Detecta clientas en estado 'atencion_personalizada' que llevan > 30-45 minutos esperando sin respuesta.
+    """
+    try:
+        now_ts = time.time()
+        async with async_session_factory() as db:
+            res = await db.execute(
+
+                select(Conversacion).where(
+                    Conversacion.menu_estado == MENU_ESTADO_ATENCION_PERSONALIZADA
+                )
+            )
+            for conv in res.scalars().all():
+                state = conv.estado or {}
+                at_ts = state.get("atencion_personalizada_at")
+                alerted = state.get("unattended_alert_sent", False)
+                if at_ts and not alerted:
+                    elapsed_min = int((now_ts - float(at_ts)) / 60)
+                    if elapsed_min >= 30:
+                        await notify_unattended_client_event(
+                            phone=conv.phone,
+                            nombre=state.get("nombre", "Clienta"),
+                            wait_minutes=elapsed_min,
+                            tenant_id=conv.tenant_id or "glowlab",
+                        )
+                        state["unattended_alert_sent"] = True
+                        conv.estado = dict(state)
+                        await db.commit()
+    except Exception as e:
+        logger.error(f"Error en run_unattended_atencion_personalizada_scan: {e}")
+
+
+async def send_daily_evening_summary(tenant_id: str = "glowlab") -> str:
+    """Envía el resumen de fin de día (8:00 PM) con la agenda completa de mañana."""
+    report = await get_staff_citas_report(staff_name="Equipo", timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
+    msg = f"🌙 *Resumen de Cierre de Jornada (8:00 PM)*\n\nAquí tienes la agenda completa programada para mañana:\n\n{report}"
+    await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+    return msg
+
+
+async def send_daily_morning_summary(tenant_id: str = "glowlab") -> str:
+    """Envía el resumen de inicio de día (8:00 AM) con la agenda de hoy y vacía las notificaciones nocturnas."""
+    flushed = await flush_pending_staff_notifications(tenant_id=tenant_id)
+    logger.info(f"🌅 Vaciadas {flushed} notificaciones nocturnas para tenant '{tenant_id}'")
+
+    report = await get_staff_citas_report(staff_name="Equipo", timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
+    msg = f"☀️ *Resumen de Inicio de Jornada (8:00 AM)*\n\n¡Buenos días equipo! Esta es la agenda de citas para hoy:\n\n{report}"
+    await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+    return msg
+
+
+async def send_weekly_summary(tenant_id: str = "glowlab") -> str:
+    """Envía el resumen semanal (Lunes 8:00 AM) con métricas, servicios más pedidos e ingresos estimados."""
+    today = date.today()
+    target_dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(
+                select(Cita).where(
+                    and_(
+                        Cita.tenant_id == tenant_id,
+                        Cita.fecha.in_(target_dates),
+                        Cita.estado.in_(["pendiente", "confirmada"]),
+                    )
+                )
+            )
+            citas = res.scalars().all()
+
+        total_citas = len(citas)
+        from collections import Counter
+        servicios_count = Counter(c.servicio for c in citas if c.servicio)
+        top_3 = servicios_count.most_common(3)
+        ingresos_est = sum(float(c.adelanto_monto or 20.0) for c in citas)
+
+        lines = [
+            f"📊 *Resumen Semanal de Agenda — Glowlab*",
+            f"📅 Periodo: *Del {format_fecha_es(today)} al {format_fecha_es(today + timedelta(days=6))}*",
+            f"Total citas programadas: *{total_citas}*",
+            f"Ingresos estimados en adelantos: *S/ {ingresos_est:.2f}*\n",
+            "💇‍♀️ *Servicios más solicitados esta semana:*"
+        ]
+        if top_3:
+            for srv, cnt in top_3:
+                lines.append(f"• {srv}: *{cnt} cita(s)*")
+        else:
+            lines.append("• Sin servicios registrados aún")
+
+        msg = "\n".join(lines)
+        await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+        return msg
+    except Exception as e:
+        logger.error(f"Error generando resumen semanal: {e}")
+        return f"Error: {e}"
+
+
+async def send_monthly_summary(tenant_id: str = "glowlab") -> str:
+    """Envía el resumen mensual (1° del mes 8:00 AM) con métricas del mes anterior."""
+    today = date.today()
+    first_day_current = date(today.year, today.month, 1)
+    last_day_prev = first_day_current - timedelta(days=1)
+    first_day_prev = date(last_day_prev.year, last_day_prev.month, 1)
+
+    prev_month_str = first_day_prev.strftime("%Y-%m")
+    try:
+        async with async_session_factory() as db:
+            res = await db.execute(
+                select(Cita).where(
+                    and_(
+                        Cita.tenant_id == tenant_id,
+                        Cita.fecha.like(f"{prev_month_str}%"),
+                        Cita.estado == "completada",
+                    )
+                )
+            )
+            citas_completadas = res.scalars().all()
+
+        total_completadas = len(citas_completadas)
+        from collections import Counter
+        top_services = Counter(c.servicio for c in citas_completadas if c.servicio).most_common(3)
+        total_ingresos = sum(float(c.adelanto_monto or 20.0) for c in citas_completadas)
+
+        lines = [
+            f"🏆 *Resumen Mensual de Rendimiento — Glowlab*",
+            f"📅 Mes evaluado: *{first_day_prev.strftime('%B %Y')}*",
+            f"Total citas atendidas: *{total_completadas}*",
+            f"Ingresos recaudados (adelantos): *S/ {total_ingresos:.2f}*\n",
+            "💅 *Top 3 Servicios Realizados:*"
+        ]
+        if top_services:
+            for srv, cnt in top_services:
+                lines.append(f"• {srv}: *{cnt} atendida(s)*")
+        else:
+            lines.append("• Sin citas completadas registradas en el mes")
+
+        msg = "\n".join(lines)
+        await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+        return msg
+    except Exception as e:
+        logger.error(f"Error generando resumen mensual: {e}")
+        return f"Error: {e}"
+
 
 

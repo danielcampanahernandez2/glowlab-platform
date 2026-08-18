@@ -426,8 +426,9 @@ async def test_reset_by_staff_command():
         staff_name="Lizbeth",
         message=f"liberar bot {client_phone}",
     )
-    assert "✅ Bot liberado" in reply
+    assert "Bot liberado" in reply
     assert client_phone in reply
+
 
     # 2. El estado del cliente vuelve a no_iniciado
     state_after = await svc.load_state(client_phone)

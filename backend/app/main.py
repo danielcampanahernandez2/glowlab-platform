@@ -51,18 +51,43 @@ _init_sentry()
 # ──────────────────────────────────────────────────────────────
 
 def _start_reminder_scheduler() -> None:
-    """Inicia APScheduler para enviar recordatorios y seguimientos automáticos."""
+    """Inicia APScheduler para enviar recordatorios, alertas y resúmenes automáticos."""
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from app.modules.salon.services import run_reminder_check, run_post_service_followup_check
+        from app.modules.salon.services import (
+            run_reminder_check,
+            run_post_service_followup_check,
+            run_staff_2h_reminder_scan,
+            run_noshow_alert_scan,
+            run_unattended_atencion_personalizada_scan,
+            send_daily_evening_summary,
+            send_daily_morning_summary,
+            send_weekly_summary,
+            send_monthly_summary,
+        )
 
         scheduler = AsyncIOScheduler(timezone="America/Lima")
-        # 1. Recordatorios preventivos de citas (24h y 2h antes) - cada hora en punto
+        # 1. Recordatorios preventivos a clientas (24h y 2h antes) - cada hora en punto
         scheduler.add_job(run_reminder_check, "cron", minute=0, id="glowlab_reminders")
-        # 2. Seguimiento post-servicio automatizado - cada 5 minutos
+        # 2. Seguimiento post-servicio automatizado a clientas - cada 5 minutos
         scheduler.add_job(run_post_service_followup_check, "interval", minutes=5, id="glowlab_post_service_followup")
+        # 3. Recordatorios 2h antes a trabajadoras/staff - cada 15 minutos
+        scheduler.add_job(run_staff_2h_reminder_scan, "interval", minutes=15, id="glowlab_staff_2h_reminders")
+        # 4. Alerta de posibles no-shows - cada 15 minutos
+        scheduler.add_job(run_noshow_alert_scan, "interval", minutes=15, id="glowlab_noshow_alerts")
+        # 5. Alerta de clientas en espera en atención personalizada - cada 15 minutos
+        scheduler.add_job(run_unattended_atencion_personalizada_scan, "interval", minutes=15, id="glowlab_unattended_scan")
+        # 6. Resumen de fin de día (8:00 PM) con agenda de mañana
+        scheduler.add_job(send_daily_evening_summary, "cron", hour=20, minute=0, id="glowlab_evening_summary")
+        # 7. Resumen de inicio de día (8:00 AM) con agenda de hoy + flush de cola nocturna
+        scheduler.add_job(send_daily_morning_summary, "cron", hour=8, minute=0, id="glowlab_morning_summary")
+        # 8. Resumen semanal (Lunes 8:05 AM)
+        scheduler.add_job(send_weekly_summary, "cron", day_of_week="mon", hour=8, minute=5, id="glowlab_weekly_summary")
+        # 9. Resumen mensual (Día 1 a las 8:10 AM)
+        scheduler.add_job(send_monthly_summary, "cron", day=1, hour=8, minute=10, id="glowlab_monthly_summary")
+
         scheduler.start()
-        logger.info("✅ Scheduler de recordatorios y seguimientos iniciado (recordatorios cada hora, seguimiento post-servicio cada 5m).")
+        logger.info("✅ Scheduler integral de recordatorios, alertas y resúmenes iniciado con timezone America/Lima.")
         return scheduler
     except ImportError:
         logger.warning("APScheduler no instalado; recordatorios automáticos desactivados.")
@@ -71,6 +96,7 @@ def _start_reminder_scheduler() -> None:
     except Exception as e:
         logger.error(f"Error iniciando scheduler: {e}")
         return None
+
 
 
 # ──────────────────────────────────────────────────────────────
