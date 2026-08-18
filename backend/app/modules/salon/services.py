@@ -16,16 +16,22 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 import httpx
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.modules.salon.models import Cita, Cliente, Conversacion, OpenAIUsageLog, Tenant, Service, StaffMember
+from app.modules.salon.models import Cita, Cliente, Conversacion, OpenAIUsageLog, Tenant, Service, StaffMember, ServiceFollowup
+
 from app.modules.salon.prompts import CLIENT_SYSTEM_PROMPT, build_tenant_system_prompt, DEFAULT_GLOWLAB_CATALOG
 
 logger = logging.getLogger("glowlab.salon.services")
@@ -130,6 +136,26 @@ MONTHS_ES: Dict[int, str] = {
 }
 
 REDIS_STATE_TTL = 60 * 60 * 48   # 48 horas
+SESSION_TIMEOUT_SECONDS = 3 * 3600  # 3 horas (10,800 segundos)
+
+INTERACTIVE_MENU_MESSAGE = (
+    "¡Hola! ✨ Bienvenida a Glowlab. \n"
+    "Para brindarte una mejor atención, te invitamos a elegir una de las siguientes opciones:\n"
+    "1️⃣ Asistente virtual: Para ver servicios, consultar precios y agendar tu cita de forma automática y rápida.\n"
+    "2️⃣ Atención personalizada: Para consultas directas, dudas específicas o asesoría detallada.\n"
+    "¿Qué opción elijes? Responde con el número."
+)
+
+HUMAN_ADVISOR_CONFIRMATION_MESSAGE = (
+    "¡Perfecto! Un asesor se comunicará contigo en breve para brindarte atención personalizada. 🌸"
+)
+
+MENU_INVALID_OPTION_MESSAGE = (
+    "Por favor, elige una de las siguientes opciones respondiendo con el número:\n\n"
+    "1️⃣ Asistente virtual: Para ver servicios, consultar precios y agendar tu cita de forma automática y rápida.\n"
+    "2️⃣ Atención personalizada: Para consultas directas, dudas específicas o asesoría detallada."
+)
+
 
 # ============================================================
 # ============================================================
@@ -978,15 +1004,200 @@ async def clear_state(phone: str, tenant_id: str = "glowlab") -> None:
     phone_norm = normalize_phone(phone)
     mem_key = f"{tenant_id}:{phone_norm}"
     redis_key = f"tenant:{tenant_id}:conv:{phone_norm}"
+    session_key = f"tenant:{tenant_id}:session:{phone_norm}"
     _in_memory_state.pop(mem_key, None)
     try:
         r = await _get_redis()
         if r:
-            await r.delete(redis_key)
+            await r.delete(redis_key, session_key)
     except Exception as e:
         logger.warning(f"Error borrando estado Redis ({tenant_id}:{phone_norm}): {e}")
 
-    await save_state(phone_norm, {"paso": "inicial"}, tenant_id=tenant_id)
+    await save_state(phone_norm, {"paso": "inicial", "session_active": False}, tenant_id=tenant_id)
+
+
+# ============================================================
+# GESTIÓN DE SESIÓN Y MENÚ INTERACTIVO (REDIS + POSTGRESQL)
+# ============================================================
+
+def is_greeting_message(text: str) -> bool:
+    """
+    Detecta si el mensaje es un saludo natural (ej. 'Hola', 'Buenos días', 'Buenas tardes', etc.).
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    t_clean = re.sub(r"[^\w\s]", " ", t)
+    tokens = t_clean.split()
+    if not tokens:
+        return False
+
+    greeting_words = {
+        "hola", "holas", "holaa", "holaaa", "buenos", "buenas",
+        "hi", "hey", "hello", "saludos", "start", "inicio", "menu", "menú"
+    }
+    greeting_phrases = [
+        "buenos dias", "buenos días", "buenas tardes", "buenas noches",
+        "hola buenas", "hola buenos dias", "hola buenos días", "hola buenas tardes", "hola buenas noches",
+        "saludos cordiales", "que tal", "qué tal", "buen dia", "buen día"
+    ]
+
+    for phrase in greeting_phrases:
+        if phrase in t:
+            return True
+
+    if tokens[0] in greeting_words:
+        return True
+
+    return False
+
+
+def is_scheduling_intent_message(text: str) -> bool:
+    """
+    Detecta si el mensaje contiene intenciones de agendamiento o reserva
+    (ej. 'quiero hacer una cita', 'agendar', 'reservar', 'quiero una cita').
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    scheduling_keywords = [
+        "quiero hacer una cita", "quiero una cita", "hacer una cita", "sacar una cita",
+        "quiero agendar", "quisiera agendar", "deseo agendar", "agendar una cita",
+        "agendar cita", "agendar", "quiero reservar", "quisiera reservar",
+        "deseo reservar", "reservar una cita", "reservar cita", "reservar",
+        "separar cita", "separar una cita", "separar turno", "sacar cita",
+        "sacar turno", "pedir cita", "pedir una cita", "solicitar cita",
+        "necesito una cita", "necesito agendar", "necesito reservar"
+    ]
+    for kw in scheduling_keywords:
+        if kw in t:
+            return True
+    return False
+
+
+def is_interactive_menu_trigger(text: str) -> bool:
+    """Verifica si el mensaje es un disparador para presentar el Menú Interactivo."""
+    return is_greeting_message(text) or is_scheduling_intent_message(text)
+
+
+def is_menu_option_1(text: str) -> bool:
+    """Verifica si la respuesta del usuario corresponde a la Opción 1 (Asistente Virtual)."""
+    t = text.strip().lower()
+    if t in ("1", "1.", "1️⃣", "uno", "primera", "opcion 1", "opción 1", "opc 1", "asistente", "asistente virtual", "ia", "robot", "bot"):
+        return True
+    if re.match(r"^1(\b|\.|\))", t) or t == "1":
+        return True
+    return False
+
+
+def is_menu_option_2(text: str) -> bool:
+    """Verifica si la respuesta del usuario corresponde a la Opción 2 (Atención Personalizada)."""
+    t = text.strip().lower()
+    if t in ("2", "2.", "2️⃣", "dos", "segunda", "opcion 2", "opción 2", "opc 2", "atencion personalizada", "atención personalizada", "asesor", "asesora", "humano", "persona"):
+        return True
+    if re.match(r"^2(\b|\.|\))", t) or t == "2":
+        return True
+    return False
+
+
+async def check_session_active(state: Dict[str, Any], phone: str, tenant_id: str = "glowlab") -> bool:
+    """
+    Verifica si la sesión de IA está activa (session_active == True) y no ha superado
+    el umbral de 3 horas de inactividad. Si han pasado >3h, desactiva la sesión automáticamente.
+    """
+    phone_norm = normalize_phone(phone)
+    session_active = bool(state.get("session_active", False))
+
+    if not session_active:
+        return False
+
+    last_interaction = state.get("last_interaction_at")
+    now_ts = time.time()
+
+    if last_interaction is not None:
+        try:
+            if isinstance(last_interaction, str):
+                try:
+                    last_ts = float(last_interaction)
+                except ValueError:
+                    last_dt = datetime.fromisoformat(last_interaction)
+                    last_ts = last_dt.timestamp()
+            elif isinstance(last_interaction, (int, float)):
+                last_ts = float(last_interaction)
+            else:
+                last_ts = now_ts
+
+            if (now_ts - last_ts) > SESSION_TIMEOUT_SECONDS:
+                logger.info(f"⏳ [SESIÓN EXPIRADA] Sesión de IA desactivada tras 3h de inactividad para {tenant_id}:{phone_norm}")
+                await deactivate_ai_session(phone_norm, state, tenant_id=tenant_id, paso="inicial")
+                return False
+        except Exception as e:
+            logger.warning(f"Error verificando inactividad de sesión ({tenant_id}:{phone_norm}): {e}")
+
+    # Verificar existencia en Redis
+    try:
+        r = await _get_redis()
+        if r:
+            session_key = f"tenant:{tenant_id}:session:{phone_norm}"
+            exists = await r.exists(session_key)
+            if not exists and last_interaction:
+                state["session_active"] = False
+                return False
+    except Exception as e:
+        logger.debug(f"Aviso consultando clave de sesión Redis: {e}")
+
+    return True
+
+
+async def activate_ai_session(phone: str, state: Dict[str, Any], tenant_id: str = "glowlab") -> None:
+    """
+    Activa el flag de sesión de la IA (session_active = True), resetea el temporizador de inactividad
+    y actualiza la clave en Redis con TTL de 3 horas.
+    """
+    phone_norm = normalize_phone(phone)
+    now_ts = time.time()
+    state["session_active"] = True
+    state["last_interaction_at"] = now_ts
+    state["menu_displayed"] = False
+    state["paso"] = "asistente_ia"
+
+    try:
+        r = await _get_redis()
+        if r:
+            session_key = f"tenant:{tenant_id}:session:{phone_norm}"
+            await r.set(session_key, "1", ex=SESSION_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.warning(f"Error activando clave de sesión en Redis ({tenant_id}:{phone_norm}): {e}")
+
+    await save_state(phone_norm, state, tenant_id=tenant_id)
+
+
+async def deactivate_ai_session(
+    phone: str,
+    state: Dict[str, Any],
+    tenant_id: str = "glowlab",
+    paso: Optional[str] = None
+) -> None:
+    """
+    Desactiva el flag de sesión de la IA (session_active = False), apagando automáticamente
+    la IA tras confirmación de cita, derivación a asesor humano o expiración de inactividad.
+    """
+    phone_norm = normalize_phone(phone)
+    state["session_active"] = False
+    state["menu_displayed"] = False
+    if paso:
+        state["paso"] = paso
+
+    try:
+        r = await _get_redis()
+        if r:
+            session_key = f"tenant:{tenant_id}:session:{phone_norm}"
+            await r.delete(session_key)
+    except Exception as e:
+        logger.warning(f"Error eliminando clave de sesión en Redis ({tenant_id}:{phone_norm}): {e}")
+
+    await save_state(phone_norm, state, tenant_id=tenant_id)
+
 
 
 # ============================================================
@@ -1612,8 +1823,10 @@ async def execute_tool_call(
         state["cita_id"] = cita_id
         state["servicio"] = service
         state["fecha"] = date_str
-        state["hora"] = hora_norm
         state["paso"] = "esperando_voucher" if requires_deposit else "cita_confirmada"
+        if not requires_deposit:
+            state["session_active"] = False
+
 
         instruction_msg = (
             f"Informa al cliente que su cita ha sido pre-registrada con éxito. Explícale que para confirmarla debe abonar el adelanto de S/ {int(deposit_amount) if deposit_amount.is_integer() else deposit_amount} por Yape/Plin y enviar la foto del comprobante aquí."
@@ -2252,44 +2465,342 @@ def build_reminder_message(cita: "Cita") -> str:
     )
 
 
-# Mensajes de seguimiento post-servicio por especialidad
-_FOLLOWUP: Dict[str, str] = {
+# ============================================================
+# SEGUIMIENTO POST-SERVICIO Y RECORDATORIOS AUTOMÁTICOS
+# ============================================================
+
+FOLLOWUP_WINDOW_START_HOUR = 8   # 08:00 AM
+FOLLOWUP_WINDOW_END_HOUR = 21   # 09:00 PM
+
+
+def is_within_followup_window(dt: Optional[datetime] = None) -> bool:
+    """
+    Verifica si la hora en zona horaria Perú (America/Lima / UTC-5) se encuentra
+    dentro de la ventana permitida (08:00 a 21:00).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz_lima = ZoneInfo("America/Lima")
+    except Exception:
+        tz_lima = timezone(timedelta(hours=-5))
+
+    if dt is None:
+        dt = datetime.now(tz_lima)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(tz_lima)
+    else:
+        dt = dt.astimezone(tz_lima)
+
+    return FOLLOWUP_WINDOW_START_HOUR <= dt.hour < FOLLOWUP_WINDOW_END_HOUR
+
+
+DEFAULT_FOLLOWUP_TEMPLATES = {
     "unas": (
-        "✨ ¡Gracias por visitarnos en *Glowlab*!\n\n"
-        "Para mantener tus uñas perfectas:\n"
-        "• Usa guantes al lavar 🧤\n"
-        "• Hidrata tu cutícula diariamente\n"
-        "• Evita usarlas como herramienta\n\n"
-        "¡Esperamos verte pronto! 💅"
+        "✨ ¡Hola {cliente_nombre}! Gracias por visitarnos en *{business_name}* 💅\n\n"
+        "Recomendaciones para el cuidado de tus {servicio}:\n"
+        "• Usa guantes al realizar tareas del hogar 🧤\n"
+        "• Hidrata tus cutículas diariamente\n"
+        "• Evita usarlas como herramientas\n\n"
+        "Cualquier consulta estamos a tu disposición. ¡Esperamos verte pronto! 🌸"
     ),
     "pestanas": (
-        "✨ ¡Gracias por tu visita a *Glowlab*!\n\n"
-        "Cuidados para tus pestañas:\n"
-        "• Evita mojarlas las primeras 24h 💧\n"
-        "• No uses máscara de pestañas\n"
-        "• Péinalas suavemente cada mañana\n\n"
-        "¡Luzcan esos ojos! 👁️"
+        "✨ ¡Hola {cliente_nombre}! Gracias por tu visita a *{business_name}* 👁️\n\n"
+        "Cuidados recomendados para tus {servicio}:\n"
+        "• Evita mojarlas durante las primeras 24h 💧\n"
+        "• Péinalas suavemente cada mañana\n"
+        "• Evita productos oleosos en el contorno de ojos\n\n"
+        "¡Que tengas un excelente día! ✨"
     ),
     "capilar": (
-        "✨ ¡Gracias por tu visita a *Glowlab*!\n\n"
-        "Recomendaciones para tu cabello:\n"
-        "• Usa el shampoo indicado 🧴\n"
-        "• Evita calor excesivo esta semana\n"
-        "• Hidrata con mascarilla semanal\n\n"
-        "¡Nos vemos pronto! 🌟"
+        "✨ ¡Hola {cliente_nombre}! Gracias por confiar en *{business_name}* para tu {servicio} 💇‍♀️\n\n"
+        "Consejos para maximizar el resultado:\n"
+        "• Usa productos libres de sal y sulfatos 🧴\n"
+        "• Evita calor excesivo directo esta semana\n"
+        "• Aplica mascarilla hidratante semanalmente\n\n"
+        "¡Nos encantó atenderte! Si tienes cualquier consulta no dudes en escribirnos. 🌟"
     ),
+    "default": (
+        "✨ ¡Hola {cliente_nombre}! Gracias por visitarnos en *{business_name}*.\n\n"
+        "Esperamos que hayas tenido una experiencia maravillosa con tu {servicio}. "
+        "Si tienes alguna duda o sugerencia, estamos aquí para atenderte.\n\n"
+        "¡Que tengas un lindo día! 🌸"
+    )
 }
 
 
+async def get_service_followup_template(
+    db: AsyncSession,
+    tenant_id: str = "glowlab",
+    service_name: Optional[str] = None,
+    service_id: Optional[int] = None,
+) -> Tuple[str, int]:
+    """
+    Obtiene la plantilla de mensaje de seguimiento y las horas de espera (delay_hours)
+    desde la tabla service_followups o fallback del catálogo.
+    Retorna (template_str, delay_hours).
+    """
+    delay_hours = 3
+    template = ""
+
+    try:
+        query = select(ServiceFollowup).where(
+            ServiceFollowup.tenant_id == tenant_id,
+            ServiceFollowup.is_active == True,
+        )
+        if service_id:
+            query = query.where(
+                or_(
+                    ServiceFollowup.service_id == service_id,
+                    ServiceFollowup.service_name.ilike(f"%{service_name}%") if service_name else False
+                )
+            )
+        elif service_name:
+            query = query.where(ServiceFollowup.service_name.ilike(f"%{service_name}%"))
+
+        result = await db.execute(query.order_by(ServiceFollowup.id.desc()))
+        row = result.scalars().first()
+        if row and row.message_template:
+            return (row.message_template, row.delay_hours or 3)
+
+        # Buscar plantilla general del tenant (sin service_id específico)
+        res_gen = await db.execute(
+            select(ServiceFollowup).where(
+                ServiceFollowup.tenant_id == tenant_id,
+                ServiceFollowup.is_active == True,
+                ServiceFollowup.service_id.is_(None),
+                ServiceFollowup.service_name.is_(None),
+            )
+        )
+        row_gen = res_gen.scalars().first()
+        if row_gen and row_gen.message_template:
+            return (row_gen.message_template, row_gen.delay_hours or 3)
+
+    except Exception as e:
+        logger.debug(f"Aviso consultando service_followups en BD ({tenant_id}): {e}")
+
+    # Fallback por categorías de servicio
+    s_low = (service_name or "").lower()
+    if any(k in s_low for k in ("pestaña", "pestana", "extension", "lash")):
+        template = DEFAULT_FOLLOWUP_TEMPLATES["pestanas"]
+    elif any(k in s_low for k in ("capilar", "cabello", "alisado", "tinte", "tratamiento", "keratina", "botox", "mechas", "corte", "hidratacion")):
+        template = DEFAULT_FOLLOWUP_TEMPLATES["capilar"]
+    elif any(k in s_low for k in ("uña", "unas", "manicure", "pedicure", "nail", "gel", "acrilica")):
+        template = DEFAULT_FOLLOWUP_TEMPLATES["unas"]
+    else:
+        template = DEFAULT_FOLLOWUP_TEMPLATES["default"]
+
+    return (template, delay_hours)
+
+
+def render_followup_message(
+    template: str,
+    cita: Cita,
+    tenant_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Renderiza la plantilla de seguimiento reemplazando los placeholders configurables.
+    Placeholders soportados: {cliente_nombre}, {nombre}, {servicio}, {asesora}, {business_name}, {fecha}, {hora}.
+    """
+    profile = tenant_profile or {}
+    business_name = profile.get("name", "Glowlab")
+    cliente_nombre = cita.cliente_nombre or "Clienta"
+    servicio = cita.servicio or "servicio"
+    asesora = cita.asesora or "nuestra especialista"
+    fecha = cita.fecha or ""
+    hora = cita.hora or ""
+
+    msg = template
+    replacements = {
+        "{cliente_nombre}": cliente_nombre,
+        "{nombre}": cliente_nombre,
+        "{servicio}": servicio,
+        "{asesora}": asesora,
+        "{business_name}": business_name,
+        "{fecha}": fecha,
+        "{hora}": hora,
+    }
+    for placeholder, val in replacements.items():
+        msg = msg.replace(placeholder, str(val))
+
+    return msg
+
+
 def build_followup_message(cita: "Cita") -> str:
-    """Selecciona el mensaje de seguimiento según el servicio realizado."""
+    """Compatibilidad con selector síncrono por defecto."""
     s = (cita.servicio or "").lower()
     if any(k in s for k in ("pestaña", "pestana", "extension", "lash")):
-        return _FOLLOWUP["pestanas"]
-    if any(k in s for k in ("capilar", "cabello", "alisado", "tinte", "tratamiento",
-                             "keratina", "botox", "mechas", "corte", "hidratacion")):
-        return _FOLLOWUP["capilar"]
-    return _FOLLOWUP["unas"]
+        return DEFAULT_FOLLOWUP_TEMPLATES["pestanas"].replace("{cliente_nombre}", cita.cliente_nombre or "Clienta").replace("{business_name}", "Glowlab").replace("{servicio}", cita.servicio or "servicio")
+    if any(k in s for k in ("capilar", "cabello", "alisado", "tinte", "tratamiento", "keratina", "botox", "mechas", "corte", "hidratacion")):
+        return DEFAULT_FOLLOWUP_TEMPLATES["capilar"].replace("{cliente_nombre}", cita.cliente_nombre or "Clienta").replace("{business_name}", "Glowlab").replace("{servicio}", cita.servicio or "servicio")
+    return DEFAULT_FOLLOWUP_TEMPLATES["unas"].replace("{cliente_nombre}", cita.cliente_nombre or "Clienta").replace("{business_name}", "Glowlab").replace("{servicio}", cita.servicio or "servicio")
+
+
+async def run_post_service_followup_check() -> int:
+    """
+    Job periódico (cada 5-10 minutos) que escanea reservas completadas para enviar
+    mensajes de seguimiento post-servicio automatizados.
+
+    Requisitos cumplidos:
+    1. Criterio de scan: estado = 'completada' AND post_service_sent = FALSE AND hora_fin + 3h <= NOW().
+    2. Update atómico: UPDATE citas SET post_service_sent = TRUE WHERE id = :id AND post_service_sent = FALSE RETURNING *
+       para calificar y marcar en la misma operación sin condición de carrera ante scans solapados.
+    3. Contenido dinámico configurable desde la tabla service_followups con placeholders.
+    4. Ventana horaria: 8:00 AM a 9:00 PM (hora Perú). Si es de noche/madrugada, posterga marcando post_service_pending_morning = TRUE.
+    5. Envío vía send_message con distributed lock por teléfono y captura en Sentry con teléfono anonimizado ante fallos.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz_lima = ZoneInfo("America/Lima")
+    except Exception:
+        tz_lima = timezone(timedelta(hours=-5))
+
+    now_lima = datetime.now(tz_lima)
+    within_window = is_within_followup_window(now_lima)
+    messages_sent = 0
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Cita).where(
+                    and_(
+                        Cita.estado == "completada",
+                        or_(Cita.post_service_sent.is_(False), Cita.post_service_sent == None),
+                    )
+                )
+            )
+            citas = result.scalars().all()
+            if not citas:
+                return 0
+
+            for cita in citas:
+                cita_id = cita.id
+                tenant_id = cita.tenant_id or "glowlab"
+                phone_norm = normalize_phone(cita.cliente_phone)
+
+                # Obtener template y delay_hours configurado
+                template, delay_hours = await get_service_followup_template(
+                    db, tenant_id=tenant_id, service_name=cita.servicio
+                )
+
+                # Calcular hora de fin
+                try:
+                    fecha_str = cita.fecha or datetime.utcnow().strftime("%Y-%m-%d")
+                    hora_str = cita.hora or "10:00"
+                    hora_fin_str = cita.hora_fin
+
+                    if not hora_fin_str:
+                        h_start, m_start = map(int, hora_str.split(":"))
+                        start_minutes = h_start * 60 + m_start + 60
+                        hora_fin_str = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}"
+
+                    end_dt_naive = datetime.strptime(f"{fecha_str} {hora_fin_str}", "%Y-%m-%d %H:%M")
+                    end_dt_lima = end_dt_naive.replace(tzinfo=tz_lima)
+                    target_send_time = end_dt_lima + timedelta(hours=delay_hours)
+
+                    # Verificar si ya transcurrieron las horas de espera
+                    if now_lima < target_send_time:
+                        continue
+
+                except Exception as ex_dt:
+                    logger.debug(f"Error calculando tiempo de cita #{cita_id}: {ex_dt}")
+                    continue
+
+                # Validar ventana horaria (8:00 AM - 9:00 PM)
+                if not within_window:
+                    # Defer para la mañana
+                    try:
+                        await db.execute(
+                            update(Cita)
+                            .where(Cita.id == cita_id, Cita.post_service_sent == False)
+                            .values(post_service_pending_morning=True, updated_at=datetime.utcnow())
+                        )
+                        await db.commit()
+                        logger.info(
+                            f"🌙 [POST-SERVICE DEFERRED] Cita #{cita_id} postergada para la mañana "
+                            f"(fuera de ventana 8am-9pm Perú: {now_lima.strftime('%H:%M')})."
+                        )
+                    except Exception as e_def:
+                        logger.warning(f"Error marcando cita #{cita_id} como pending morning: {e_def}")
+                    continue
+
+                # UPDATE ATÓMICO: Calificar y marcar la fila en la misma operación
+                atomic_res = await db.execute(
+                    update(Cita)
+                    .where(
+                        and_(
+                            Cita.id == cita_id,
+                            Cita.post_service_sent == False,
+                        )
+                    )
+                    .values(
+                        post_service_sent=True,
+                        post_service_pending_morning=False,
+                        seguimiento_enviado=True,
+                        updated_at=datetime.utcnow(),
+                    )
+                    .execution_options(synchronize_session="fetch")
+                )
+                await db.commit()
+
+                # Si rowcount == 0, otro proceso/worker ya reclamó esta reserva
+                if atomic_res.rowcount == 0:
+                    continue
+
+                # Preparar y enviar mensaje con lock distribuido por teléfono
+                profile = await get_tenant_profile(tenant_id)
+                message_text = render_followup_message(template, cita, profile)
+
+                try:
+                    async with phone_distributed_lock(phone_norm, tenant_id=tenant_id):
+                        send_ok = await send_message(phone_norm, message_text)
+
+                    if not send_ok:
+                        raise RuntimeError("Evolution API retornó respuesta no exitosa.")
+
+                    messages_sent += 1
+                    logger.info(f"💌 [POST-SERVICE ENVIADO] Seguimiento post-cita enviado con éxito a #{cita_id} ({_mask_phone(phone_norm)}).")
+
+                except Exception as e_send:
+                    masked_phone = _mask_phone(phone_norm)
+                    logger.error(
+                        f"❌ [POST-SERVICE FALLÓ] Error enviando seguimiento a cita #{cita_id} ({masked_phone}): {e_send}"
+                    )
+
+                    # Revertir post_service_sent = False para permitir reintento en el siguiente scan
+                    try:
+                        await db.execute(
+                            update(Cita)
+                            .where(Cita.id == cita_id)
+                            .values(
+                                post_service_sent=False,
+                                seguimiento_enviado=False,
+                                updated_at=datetime.utcnow(),
+                            )
+                        )
+                        await db.commit()
+                    except Exception as e_rev:
+                        logger.error(f"Error revirtiendo estado de cita #{cita_id}: {e_rev}")
+
+                    # Captura en Sentry con teléfono anonimizado
+                    try:
+                        import sentry_sdk
+                        with sentry_sdk.push_scope() as scope:
+                            scope.set_tag("module", "post_service_followup")
+                            scope.set_tag("tenant_id", tenant_id)
+                            scope.set_tag("phone_masked", masked_phone)
+                            scope.set_context("followup_error_info", {
+                                "cita_id": cita_id,
+                                "servicio": cita.servicio,
+                                "error": str(e_send)[:150],
+                            })
+                            sentry_sdk.capture_exception(e_send)
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        logger.error(f"Error en run_post_service_followup_check: {e}", exc_info=True)
+
+    return messages_sent
 
 
 # ============================================================
@@ -2298,8 +2809,8 @@ def build_followup_message(cita: "Cita") -> str:
 
 async def run_reminder_check() -> None:
     """
-    Verifica y envía recordatorios pendientes.
-    Ejecutar cada hora desde el scheduler en main.py.
+    Verifica y envía recordatorios pendientes de citas (24h y 2h antes).
+    Ejecutar periódicamente desde el scheduler en main.py.
     """
     from app.core.database import async_session_factory
 
@@ -2341,26 +2852,11 @@ async def run_reminder_check() -> None:
                 cita.recordatorio_2h_enviado = True
                 logger.info(f"Recordatorio 2h enviado → cita #{cita.id}")
 
-            # --- Seguimiento post-servicio (completadas ayer) ---
-            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-            result3 = await db.execute(
-                select(Cita).where(
-                    and_(
-                        Cita.fecha == yesterday,
-                        Cita.estado == "completada",
-                        Cita.seguimiento_enviado.is_(False),
-                    )
-                )
-            )
-            for cita in result3.scalars().all():
-                await send_message(cita.cliente_phone, build_followup_message(cita))
-                cita.seguimiento_enviado = True
-                logger.info(f"Seguimiento post-servicio enviado → cita #{cita.id}")
-
             await db.commit()
 
     except Exception as e:
         logger.error(f"Error en run_reminder_check: {e}", exc_info=True)
+
 
 
 # ============================================================

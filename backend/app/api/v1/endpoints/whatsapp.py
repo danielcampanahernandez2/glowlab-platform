@@ -8,7 +8,9 @@ Sistema dual de atención:
 import logging
 import random
 import difflib
+import time
 from typing import Any, Dict, List, Optional
+
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
 
@@ -48,7 +50,7 @@ async def handle_staff_message(
 
 
 # ============================================================
-# MANEJADOR: CLIENTAS (AGENTE CONVERSACIONAL CON FUNCTION CALLING)
+# MANEJADOR: CLIENTAS (MENÚ INTERACTIVO + AGENTE CONVERSACIONAL)
 # ============================================================
 
 async def handle_client_message(
@@ -60,9 +62,11 @@ async def handle_client_message(
     tenant_id: str = "glowlab",
 ) -> None:
     """
-    Atención de clientas a través del Agente Conversacional Autónomo asociado al tenant.
-    Permite diálogo libre, cambios de tema y ejecución autónoma de reservas y consultas.
-    Utiliza lock distribuido por (tenant_id, teléfono) para garantizar procesamiento serializado.
+    Atención de clientas con Menú Interactivo y control de estados de sesión en Redis.
+    - Saludos o intenciones de agendamiento -> Envía Menú Interactivo (Opción 1: IA, Opción 2: Humano).
+    - Opción 1: Activa la sesión (session_active = True) y OpenAI toma el control.
+    - Opción 2: Desactiva sesión (session_active = False), confirma contacto de asesor y bloquea IA.
+    - Apagado automático: Desactiva la sesión tras confirmar cita o 3 horas de inactividad.
     """
     phone_norm = svc.normalize_phone(sender_number)
     has_image = "imageMessage" in message_data
@@ -70,10 +74,13 @@ async def handle_client_message(
     # Indicador visual de presencia 'escribiendo...' (composing) en WhatsApp
     async with svc.typing_indicator(phone_norm):
         async with svc.phone_distributed_lock(phone_norm, tenant_id=tenant_id):
-            # Manejo de comprobantes de pago recibidos como imagen
+            state = await svc.load_state(phone_norm, tenant_id=tenant_id)
+            if sender_name and not state.get("nombre"):
+                state["nombre"] = sender_name
+
+            # 1. Manejo de comprobantes de pago recibidos como imagen
             if has_image:
                 async with async_session_factory() as db:
-                    state = await svc.load_state(phone_norm, tenant_id=tenant_id)
                     intent_data = await svc.extract_intent(state, message_text)
                     await _handle_voucher_step(
                         phone_norm, state, message_text,
@@ -82,18 +89,76 @@ async def handle_client_message(
                     )
                     return
 
-            # Procesamiento inteligente con el Agente Conversacional OpenAI/DeepSeek
-            reply = await svc.run_conversational_agent(
-                sender_number=phone_norm,
-                sender_name=sender_name,
-                message_text=message_text,
-                message_data=message_data,
-                raw_item=raw_item,
-                tenant_id=tenant_id,
-            )
+            clean_text = (message_text or "").strip()
+            if not clean_text:
+                return
 
-            if reply:
-                await svc.send_message(phone_norm, reply)
+            # 2. Verificar estado de sesión y temporizador de inactividad (3 horas)
+            is_active = await svc.check_session_active(state, phone_norm, tenant_id=tenant_id)
+
+            # 3. Evaluar Disparadores del Menú Interactivo (Saludos o Intención de Agendamiento)
+            is_trigger = svc.is_interactive_menu_trigger(clean_text)
+
+            # Disparar menú si la sesión está inactiva, o si se encuentra en pasos iniciales/finalizados/derivados
+            if is_trigger and (not is_active or state.get("paso") in ("inicial", "menu_interactivo", "derivada", "cita_confirmada")):
+                state["menu_displayed"] = True
+                state["paso"] = "menu_interactivo"
+                state["session_active"] = False
+                state["last_interaction_at"] = time.time()
+                await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+                await svc.send_message(phone_norm, svc.INTERACTIVE_MENU_MESSAGE)
+                return
+
+            # 4. Evaluar selección cuando el menú está desplegado / esperando respuesta
+            if state.get("menu_displayed") or state.get("paso") == "menu_interactivo":
+                if svc.is_menu_option_1(clean_text):
+                    # Opción 1: Asistente virtual (OpenAI toma el control)
+                    await svc.activate_ai_session(phone_norm, state, tenant_id=tenant_id)
+                    welcome_ai = (
+                        "¡Perfecto! ✨ Soy tu asistente virtual de Glowlab. 🌸\n"
+                        "¿En qué te puedo ayudar hoy? Puedes consultarme sobre nuestros servicios (pestañas, uñas, tratamientos capilares), precios o agendar tu cita de forma rápida. 😊"
+                    )
+                    await svc.send_message(phone_norm, welcome_ai)
+                    return
+
+                elif svc.is_menu_option_2(clean_text):
+                    # Opción 2: Atención personalizada (Asesor humano)
+                    await svc.deactivate_ai_session(phone_norm, state, tenant_id=tenant_id, paso="derivada")
+                    await svc.send_message(phone_norm, svc.HUMAN_ADVISOR_CONFIRMATION_MESSAGE)
+                    await svc.notify_all_staff(
+                        f"🔔 [{tenant_id}] Clienta +{phone_norm} ({state.get('nombre', sender_name)}) "
+                        f"ha solicitado atención personalizada con una asesora (Opción 2)."
+                    )
+                    return
+
+                elif not is_active:
+                    # Respuesta no reconocida mientras el menú está en espera
+                    await svc.send_message(phone_norm, svc.MENU_INVALID_OPTION_MESSAGE)
+                    return
+
+            # 5. Si la sesión de IA está activa: procesar con el Agente Conversacional OpenAI
+            if is_active:
+                state["last_interaction_at"] = time.time()
+                await svc.save_state(phone_norm, state, tenant_id=tenant_id)
+
+                reply = await svc.run_conversational_agent(
+                    sender_number=phone_norm,
+                    sender_name=sender_name,
+                    message_text=message_text,
+                    message_data=message_data,
+                    raw_item=raw_item,
+                    tenant_id=tenant_id,
+                )
+
+                if reply:
+                    await svc.send_message(phone_norm, reply)
+                return
+
+            # 6. Si la sesión NO está activa y está en atención personalizada humana: IA bloqueada
+            if state.get("paso") == "derivada" or not is_active:
+                logger.info(f"🔇 [IA BLOQUEADA] Mensaje de +{phone_norm} ignorado por IA en modo atención personalizada: '{clean_text}'")
+                return
+
 
 # ============================================================
 # GESTIÓN DE COMPROBANTES DE PAGO (VOUCHERS)
@@ -117,7 +182,7 @@ async def _handle_voucher_step(
         k in message_text.lower() for k in ("sin adelanto", "no puedo pagar", "excepcion", "excepción")
     ):
         state["paso"] = "derivada"
-        await svc.save_state(sender_number, state, tenant_id=tenant_id)
+        await svc.deactivate_ai_session(sender_number, state, tenant_id=tenant_id, paso="derivada")
         await svc.notify_all_staff(
             f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
             f"solicita excepción de adelanto.\n"
@@ -150,7 +215,8 @@ async def _handle_voucher_step(
             await svc.notify_advisor(asesora, svc.build_staff_notification(state, sender_number))
 
             state["paso"] = "cita_confirmada"
-            await svc.save_state(sender_number, state, tenant_id=tenant_id)
+            # Apagado automático de la sesión de IA tras confirmación exitosa de cita
+            await svc.deactivate_ai_session(sender_number, state, tenant_id=tenant_id, paso="cita_confirmada")
             await svc.send_message(sender_number, svc.build_confirmation_message(state))
 
         else:
@@ -160,7 +226,7 @@ async def _handle_voucher_step(
 
             if intentos >= 3:
                 state["paso"] = "derivada"
-                await svc.save_state(sender_number, state)
+                await svc.deactivate_ai_session(sender_number, state, tenant_id=tenant_id, paso="derivada")
                 await svc.notify_all_staff(
                     f"⚠️ Clienta +{sender_number} ({state.get('nombre', '')}) "
                     f"tuvo problemas con el comprobante. Verificar manualmente."
@@ -183,6 +249,7 @@ async def _handle_voucher_step(
             sender_number,
             f"Para confirmar tu cita envíanos la imagen del comprobante de S/ {settings.ADVANCE_AMOUNT}. 📸"
         )
+
 
 
 # ============================================================

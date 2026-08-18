@@ -154,6 +154,29 @@ class Cita(Base):
     recordatorio_24h_enviado = Column(Boolean, default=False)
     recordatorio_2h_enviado = Column(Boolean, default=False)
     seguimiento_enviado = Column(Boolean, default=False)
+    post_service_sent = Column(Boolean, default=False, nullable=False, index=True)
+    post_service_pending_morning = Column(Boolean, default=False, nullable=False)
+    hora_fin = Column(String(10), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ServiceFollowup(Base):
+    """
+    Configuración dinámica de mensajes de seguimiento post-cita por servicio y tenant.
+    Permite personalizar el contenido del mensaje y el tiempo de espera (delay_hours)
+    para múltiples negocios y rubros de manera desacoplada.
+    """
+    __tablename__ = "service_followups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String(100), default="glowlab", nullable=False, index=True)
+    service_id = Column(Integer, nullable=True, index=True)
+    service_name = Column(String(200), nullable=True, index=True)
+    message_template = Column(Text, nullable=False)
+    delay_hours = Column(Integer, default=3, nullable=False)
+    is_active = Column(Boolean, default=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -176,3 +199,4 @@ class OpenAIUsageLog(Base):
     total_tokens = Column(Integer, default=0)
     cost_usd = Column(Numeric(10, 6), default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+

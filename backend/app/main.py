@@ -54,17 +54,20 @@ def _start_reminder_scheduler() -> None:
     """Inicia APScheduler para enviar recordatorios y seguimientos automáticos."""
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from app.modules.salon.services import run_reminder_check
+        from app.modules.salon.services import run_reminder_check, run_post_service_followup_check
 
         scheduler = AsyncIOScheduler(timezone="America/Lima")
-        # Cada hora en punto
+        # 1. Recordatorios preventivos de citas (24h y 2h antes) - cada hora en punto
         scheduler.add_job(run_reminder_check, "cron", minute=0, id="glowlab_reminders")
+        # 2. Seguimiento post-servicio automatizado - cada 5 minutos
+        scheduler.add_job(run_post_service_followup_check, "interval", minutes=5, id="glowlab_post_service_followup")
         scheduler.start()
-        logger.info("✅ Scheduler de recordatorios iniciado (cada hora).")
+        logger.info("✅ Scheduler de recordatorios y seguimientos iniciado (recordatorios cada hora, seguimiento post-servicio cada 5m).")
         return scheduler
     except ImportError:
         logger.warning("APScheduler no instalado; recordatorios automáticos desactivados.")
         return None
+
     except Exception as e:
         logger.error(f"Error iniciando scheduler: {e}")
         return None
