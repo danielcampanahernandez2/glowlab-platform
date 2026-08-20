@@ -154,7 +154,7 @@ async def test_self_chat_message_routes_to_staff_and_never_triggers_client_menu(
 
     with (
         patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_replies.append(msg))),
-        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value="📋 Agenda de Citas: 0 citas hoy")),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=("📋 Agenda de Citas: 0 citas hoy", False))),
     ):
         await process_webhook_payload(payload)
 
@@ -195,7 +195,7 @@ async def test_instance_number_self_chat_routes_to_staff():
 
     with (
         patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_replies.append(msg))),
-        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value="📋 Agenda de Citas: 0 citas mañana")),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=("📋 Agenda de Citas: 0 citas mañana", False))),
     ):
         await process_webhook_payload(payload)
 
@@ -480,11 +480,11 @@ async def test_noshow_alert_scan_atomic_update():
 
 @pytest.mark.asyncio
 async def test_daily_evening_and_morning_summaries():
-    """Verifica la generación de resúmenes de fin de día (8pm) y de inicio de día (8am)."""
+    """Verifica la generación de resúmenes de fin de día (8pm) y de inicio de día (8am) cuando HAY citas."""
     sent = []
     with (
         patch("app.modules.salon.services.send_staff_notification", new=AsyncMock(side_effect=lambda msg, **kw: sent.append(msg))),
-        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value="• Cita #1: 10:00 AM - Lucia")),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=("• Cita #1: 10:00 AM - Lucia", True))),
     ):
         # 8:00 PM
         await svc.send_daily_evening_summary(tenant_id="glowlab")
@@ -495,3 +495,65 @@ async def test_daily_evening_and_morning_summaries():
         await svc.send_daily_morning_summary(tenant_id="glowlab")
         assert len(sent) == 2
         assert "Resumen de Inicio de Jornada (8:00 AM)" in sent[1]
+
+
+@pytest.mark.asyncio
+async def test_daily_summaries_omitted_when_zero_citas(fake_redis):
+    """Verifica que los resúmenes de 8am y 8pm se OMITAN (sin notificar a staff) cuando hay 0 citas y 0 notificaciones nocturnas."""
+    sent = []
+    no_citas_report = "📅 *Agenda — Glowlab*\n\nNo hay citas activas programadas para todo el equipo en el periodo: *Hoy*. ✨"
+    with (
+        patch("app.modules.salon.services._get_redis", return_value=fake_redis),
+        patch("app.modules.salon.services.send_staff_notification", new=AsyncMock(side_effect=lambda msg, **kw: sent.append(msg))),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=(no_citas_report, False))),
+        patch("app.modules.salon.services.flush_pending_staff_notifications", new=AsyncMock(return_value=0)),
+    ):
+        # 8:00 PM sin citas -> Omitido
+        res_evening = await svc.send_daily_evening_summary(tenant_id="glowlab")
+        assert len(sent) == 0
+        assert "No hay citas activas programadas" in res_evening
+
+        # 8:00 AM sin citas y 0 notificaciones nocturnas -> Omitido
+        res_morning = await svc.send_daily_morning_summary(tenant_id="glowlab")
+        assert len(sent) == 0
+        assert "No hay citas activas programadas" in res_morning
+
+
+@pytest.mark.asyncio
+async def test_daily_summaries_decoupled_from_text_phrasing(fake_redis):
+    """
+    Verifica que la guarda de resúmenes dependa EXCLUSIVAMENTE del booleano has_citas devuelto por BD,
+    y NO de comparar substrings del texto formateado (resiliencia ante cambios de copy o redacción).
+    """
+    sent = []
+    # Texto de copy modificado que no contiene la frase antigua "No hay citas activas..."
+    new_copy_text = "Zero appointments scheduled for today. Completely new wording."
+    with (
+        patch("app.modules.salon.services._get_redis", return_value=fake_redis),
+        patch("app.modules.salon.services.send_staff_notification", new=AsyncMock(side_effect=lambda msg, **kw: sent.append(msg))),
+        patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=(new_copy_text, False))),
+        patch("app.modules.salon.services.flush_pending_staff_notifications", new=AsyncMock(return_value=0)),
+    ):
+        # 8:00 PM con 0 citas y nuevo copy -> Omitido basándose en has_citas=False
+        res_evening = await svc.send_daily_evening_summary(tenant_id="glowlab")
+        assert len(sent) == 0
+        assert res_evening == new_copy_text
+
+        # 8:00 AM con 0 citas y nuevo copy -> Omitido basándose en has_citas=False
+        res_morning = await svc.send_daily_morning_summary(tenant_id="glowlab")
+        assert len(sent) == 0
+        assert res_morning == new_copy_text
+
+
+@pytest.mark.asyncio
+async def test_scheduled_job_distributed_lock_multi_worker(fake_redis):
+    """Simula 2 workers en paralelo ejecutando la misma tarea programada y confirma que solo 1 adquiere el lock."""
+    with patch("app.modules.salon.services._get_redis", return_value=fake_redis):
+        # Worker 1 ejecuta
+        async with svc.scheduled_job_distributed_lock("test_job_123", lock_ttl_sec=60) as acquired1:
+            assert acquired1 is True
+
+            # Worker 2 intenta ejecutar simultáneamente el mismo job
+            async with svc.scheduled_job_distributed_lock("test_job_123", lock_ttl_sec=60) as acquired2:
+                assert acquired2 is False
+

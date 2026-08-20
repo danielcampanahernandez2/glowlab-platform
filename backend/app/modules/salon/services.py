@@ -621,6 +621,27 @@ async def phone_distributed_lock(
             mem_lock.release()
 
 
+@asynccontextmanager
+async def scheduled_job_distributed_lock(job_id: str, lock_ttl_sec: int = 50):
+    """
+    Lock distribuido en Redis para evitar que una tarea programada sea ejecutada
+    por múltiples workers o procesos en paralelo (Leader Election por Job).
+    """
+    acquired = True
+    try:
+        r = await _get_redis()
+        if r:
+            lock_key = f"glowlab:scheduler_lock:{job_id}"
+            res = await r.set(lock_key, "locked", nx=True, ex=lock_ttl_sec)
+            if not res:
+                logger.info(f"🔒 [SCHEDULER LOCK] Job '{job_id}' omitido en este worker (ejecutado por otro proceso).")
+                acquired = False
+    except Exception as e:
+        logger.debug(f"Aviso verificando lock distribuido para job '{job_id}': {e}")
+
+    yield acquired
+
+
 def _mask_phone(phone: str) -> str:
     """Anonimiza un número telefónico para no exponer PII en observabilidad (ej. +519***246)."""
     p = normalize_phone(phone)
@@ -3205,8 +3226,11 @@ def parse_hora_str(text: str) -> Optional[str]:
     return None
 
 
-async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_advisors: bool = False, tenant_id: str = "glowlab") -> str:
-    """Consulta la agenda en la base de datos y genera un reporte ordenado cronológicamente para un tenant."""
+async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_advisors: bool = False, tenant_id: str = "glowlab") -> Tuple[str, bool]:
+    """
+    Consulta la agenda en la base de datos y genera un reporte ordenado cronológicamente para un tenant.
+    Retorna una tupla (report_text: str, has_citas: bool) con la representación en texto y la presencia explícita de citas.
+    """
     today = date.today()
     if timeframe in ("mañana", "manana"):
         target_dates = [(today + timedelta(days=1)).strftime("%Y-%m-%d")]
@@ -3218,6 +3242,7 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
         target_dates = [today.strftime("%Y-%m-%d")]
         periodo_title = f"Hoy ({format_fecha_es(today)})"
 
+    citas = []
     try:
         async with async_session_factory() as db:
             query = select(Cita).where(
@@ -3235,11 +3260,13 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
             citas = result.scalars().all()
     except Exception as e:
         logger.error(f"Error consultando agenda en BD ({tenant_id}): {e}")
-        return f"⚠️ Error al consultar la base de datos: {e}"
+        return (f"⚠️ Error al consultar la base de datos: {e}", False)
 
-    if not citas:
+    has_citas = len(citas) > 0
+    if not has_citas:
         advisor_label = "todo el equipo" if all_advisors else f"ti ({staff_name})"
-        return f"📅 *Agenda — Glowlab*\n\nNo hay citas activas programadas para {advisor_label} en el periodo: *{periodo_title}*. ✨"
+        msg = f"📅 *Agenda — Glowlab*\n\nNo hay citas activas programadas para {advisor_label} en el periodo: *{periodo_title}*. ✨"
+        return (msg, False)
 
     advisor_header = "Todo el equipo (Lizbeth y Anali)" if all_advisors else staff_name
     lines = [
@@ -3264,7 +3291,7 @@ async def get_staff_citas_report(staff_name: str, timeframe: str = "hoy", all_ad
         )
 
     lines.append("\n💡 _Para cancelar o mover una cita usa:_ `cancelar cita <ID>` _o_ `mover cita <ID> a <fecha/hora>`")
-    return "\n".join(lines)
+    return ("\n".join(lines), True)
 
 
 async def cancel_staff_cita(staff_name: str, staff_phone: str, query: str, tenant_id: str = "glowlab") -> str:
@@ -3693,22 +3720,28 @@ async def execute_staff_command(
 
     # 1. Consultar Citas / Agenda
     if s in ("citas hoy", "citas", "agenda hoy", "agenda", "ver citas hoy", "mis citas hoy", "mis citas"):
-        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=False, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=False, tenant_id=tenant_id)
+        return report
 
     if s in ("citas mañana", "citas manana", "agenda mañana", "agenda manana", "ver citas mañana", "ver citas manana"):
-        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=False, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=False, tenant_id=tenant_id)
+        return report
 
     if s in ("citas semana", "agenda semana", "ver citas semana", "mis citas semana"):
-        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=False, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=False, tenant_id=tenant_id)
+        return report
 
     if s in ("citas todas", "agenda todas", "citas todas hoy", "ver todas las citas"):
-        return await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
+        return report
 
     if s in ("citas todas mañana", "citas todas manana"):
-        return await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
+        return report
 
     if s in ("citas todas semana", "todas las citas semana"):
-        return await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=True, tenant_id=tenant_id)
+        report, _ = await get_staff_citas_report(staff_name, timeframe="semana", all_advisors=True, tenant_id=tenant_id)
+        return report
 
     # 2. Cancelar Cita (cancelar cita <query>, cancelar <query>, anular cita <query>)
     cancel_match = re.match(r'^(?:cancelar\s+cita|cancelar|anular\s+cita|anular)\s+(.+)$', s)
@@ -3754,51 +3787,54 @@ async def execute_staff_command(
 async def run_staff_2h_reminder_scan() -> None:
     """
     Scan periódico de APScheduler que envía recordatorios a las trabajadoras 2h antes de cada cita confirmada.
-    Usa UPDATE atómico para evitar duplicados.
+    Usa UPDATE atómico para evitar duplicados y lock distribuido para entorno multi-worker.
     """
-    try:
-        from sqlalchemy import text
-        now = datetime.utcnow()
-        today_str = now.strftime("%Y-%m-%d")
-        target_hora = (now + timedelta(hours=2)).strftime("%H:00")
+    async with scheduled_job_distributed_lock("glowlab_staff_2h_reminders") as acquired:
+        if not acquired:
+            return
+        try:
+            from sqlalchemy import text
+            now = datetime.utcnow()
+            today_str = now.strftime("%Y-%m-%d")
+            target_hora = (now + timedelta(hours=2)).strftime("%H:00")
 
-        async with async_session_factory() as db:
-            stmt = text("""
-                UPDATE citas
-                SET recordatorio_staff_2h_enviado = TRUE,
-                    updated_at = :now
-                WHERE id IN (
-                    SELECT id FROM citas
-                    WHERE fecha = :fecha
-                      AND hora = :hora
-                      AND estado = 'confirmada'
-                      AND recordatorio_staff_2h_enviado = FALSE
-                    LIMIT 20
-                )
-                RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
-            """)
-            res = await db.execute(stmt, {"fecha": today_str, "hora": target_hora, "now": now})
-            rows = res.fetchall()
-            await db.commit()
+            async with async_session_factory() as db:
+                stmt = text("""
+                    UPDATE citas
+                    SET recordatorio_staff_2h_enviado = TRUE,
+                        updated_at = :now
+                    WHERE id IN (
+                        SELECT id FROM citas
+                        WHERE fecha = :fecha
+                          AND hora = :hora
+                          AND estado = 'confirmada'
+                          AND recordatorio_staff_2h_enviado = FALSE
+                        LIMIT 20
+                    )
+                    RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
+                """)
+                res = await db.execute(stmt, {"fecha": today_str, "hora": target_hora, "now": now})
+                rows = res.fetchall()
+                await db.commit()
 
-            for row in rows:
-                c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
-                f_dt = parse_fecha(c_fec) if c_fec else None
-                f_str = format_fecha_es(f_dt) if f_dt else c_fec
-                h_str = format_hora_12h(c_hor) if c_hor else c_hor
-                msg = (
-                    f"⏰ *Recordatorio de Cita en 2 horas — Glowlab*\n\n"
-                    f"🆔 Cita #{c_id}\n"
-                    f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
-                    f"💇‍♀️ Servicio: {c_srv}\n"
-                    f"📆 Fecha: {f_str}\n"
-                    f"🕒 Hora: {h_str}\n"
-                    f"👩‍🦰 Asesora: {c_ase or 'Equipo Glowlab'}"
-                )
-                await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
-                logger.info(f"⏰ Recordatorio 2h enviado a staff para Cita #{c_id}")
-    except Exception as e:
-        logger.error(f"Error en run_staff_2h_reminder_scan: {e}", exc_info=True)
+                for row in rows:
+                    c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
+                    f_dt = parse_fecha(c_fec) if c_fec else None
+                    f_str = format_fecha_es(f_dt) if f_dt else c_fec
+                    h_str = format_hora_12h(c_hor) if c_hor else c_hor
+                    msg = (
+                        f"⏰ *Recordatorio de Cita en 2 horas — Glowlab*\n\n"
+                        f"🆔 Cita #{c_id}\n"
+                        f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
+                        f"💇‍♀️ Servicio: {c_srv}\n"
+                        f"📆 Fecha: {f_str}\n"
+                        f"🕒 Hora: {h_str}\n"
+                        f"👩‍🦰 Asesora: {c_ase or 'Equipo Glowlab'}"
+                    )
+                    await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
+                    logger.info(f"⏰ Recordatorio 2h enviado a staff para Cita #{c_id}")
+        except Exception as e:
+            logger.error(f"Error en run_staff_2h_reminder_scan: {e}", exc_info=True)
 
 
 async def run_noshow_alert_scan() -> None:
@@ -3807,98 +3843,120 @@ async def run_noshow_alert_scan() -> None:
     ya pasó hace más de 30 minutos sin haber sido completadas ni canceladas.
     Usa UPDATE atómico para alertar a la trabajadora solo una vez.
     """
-    try:
-        from sqlalchemy import text
-        now = datetime.utcnow()
-        today_str = now.strftime("%Y-%m-%d")
-        current_time_minus_30m = (now - timedelta(minutes=30)).strftime("%H:%M")
+    async with scheduled_job_distributed_lock("glowlab_noshow_alerts") as acquired:
+        if not acquired:
+            return
+        try:
+            from sqlalchemy import text
+            now = datetime.utcnow()
+            today_str = now.strftime("%Y-%m-%d")
+            current_time_minus_30m = (now - timedelta(minutes=30)).strftime("%H:%M")
 
-        async with async_session_factory() as db:
-            stmt = text("""
-                UPDATE citas
-                SET alerta_noshow_enviada = TRUE,
-                    updated_at = :now
-                WHERE id IN (
-                    SELECT id FROM citas
-                    WHERE fecha = :fecha
-                      AND hora <= :hora_limite
-                      AND estado = 'confirmada'
-                      AND alerta_noshow_enviada = FALSE
-                    LIMIT 20
-                )
-                RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
-            """)
-            res = await db.execute(stmt, {"fecha": today_str, "hora_limite": current_time_minus_30m, "now": now})
-            rows = res.fetchall()
-            await db.commit()
+            async with async_session_factory() as db:
+                stmt = text("""
+                    UPDATE citas
+                    SET alerta_noshow_enviada = TRUE,
+                        updated_at = :now
+                    WHERE id IN (
+                        SELECT id FROM citas
+                        WHERE fecha = :fecha
+                          AND hora <= :hora_limite
+                          AND estado = 'confirmada'
+                          AND alerta_noshow_enviada = FALSE
+                        LIMIT 20
+                    )
+                    RETURNING id, tenant_id, cliente_nombre, cliente_phone, servicio, fecha, hora, asesora;
+                """)
+                res = await db.execute(stmt, {"fecha": today_str, "hora_limite": current_time_minus_30m, "now": now})
+                rows = res.fetchall()
+                await db.commit()
 
-            for row in rows:
-                c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
-                h_str = format_hora_12h(c_hor) if c_hor else c_hor
-                msg = (
-                    f"⚠️ *Alerta de Posible No-Show / Cita Pendiente*\n\n"
-                    f"🆔 Cita #{c_id}\n"
-                    f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
-                    f"💇‍♀️ Servicio: {c_srv}\n"
-                    f"🕒 Hora programada: {h_str}\n\n"
-                    f"💡 _Si la clienta asistió, marca la cita como completada. Si no se presentó, puedes cancelarla o reprogramarla usando:_ `cancelar cita {c_id}`"
-                )
-                await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
-                logger.info(f"⚠️ Alerta no-show enviada a staff para Cita #{c_id}")
-    except Exception as e:
-        logger.error(f"Error en run_noshow_alert_scan: {e}", exc_info=True)
+                for row in rows:
+                    c_id, t_id, c_nom, c_tel, c_srv, c_fec, c_hor, c_ase = row
+                    h_str = format_hora_12h(c_hor) if c_hor else c_hor
+                    msg = (
+                        f"⚠️ *Alerta de Posible No-Show / Cita Pendiente*\n\n"
+                        f"🆔 Cita #{c_id}\n"
+                        f"👤 Clienta: {c_nom or 'Sin nombre'} (📱 +{c_tel})\n"
+                        f"💇‍♀️ Servicio: {c_srv}\n"
+                        f"🕒 Hora programada: {h_str}\n\n"
+                        f"💡 _Si la clienta asistió, marca la cita como completada. Si no se presentó, puedes cancelarla o reprogramarla usando:_ `cancelar cita {c_id}`"
+                    )
+                    await send_staff_notification(msg, urgent=False, tenant_id=t_id or "glowlab")
+                    logger.info(f"⚠️ Alerta no-show enviada a staff para Cita #{c_id}")
+        except Exception as e:
+            logger.error(f"Error en run_noshow_alert_scan: {e}", exc_info=True)
 
 
 async def run_unattended_atencion_personalizada_scan() -> None:
     """
     Detecta clientas en estado 'atencion_personalizada' que llevan > 30-45 minutos esperando sin respuesta.
     """
-    try:
-        now_ts = time.time()
-        async with async_session_factory() as db:
-            res = await db.execute(
+    async with scheduled_job_distributed_lock("glowlab_unattended_scan") as acquired:
+        if not acquired:
+            return
+        try:
+            now_ts = time.time()
+            async with async_session_factory() as db:
+                res = await db.execute(
 
-                select(Conversacion).where(
-                    Conversacion.menu_estado == MENU_ESTADO_ATENCION_PERSONALIZADA
+                    select(Conversacion).where(
+                        Conversacion.menu_estado == MENU_ESTADO_ATENCION_PERSONALIZADA
+                    )
                 )
-            )
-            for conv in res.scalars().all():
-                state = conv.estado or {}
-                at_ts = state.get("atencion_personalizada_at")
-                alerted = state.get("unattended_alert_sent", False)
-                if at_ts and not alerted:
-                    elapsed_min = int((now_ts - float(at_ts)) / 60)
-                    if elapsed_min >= 30:
-                        await notify_unattended_client_event(
-                            phone=conv.phone,
-                            nombre=state.get("nombre", "Clienta"),
-                            wait_minutes=elapsed_min,
-                            tenant_id=conv.tenant_id or "glowlab",
-                        )
-                        state["unattended_alert_sent"] = True
-                        conv.estado = dict(state)
-                        await db.commit()
-    except Exception as e:
-        logger.error(f"Error en run_unattended_atencion_personalizada_scan: {e}")
+                for conv in res.scalars().all():
+                    state = conv.estado or {}
+                    at_ts = state.get("atencion_personalizada_at")
+                    alerted = state.get("unattended_alert_sent", False)
+                    if at_ts and not alerted:
+                        elapsed_min = int((now_ts - float(at_ts)) / 60)
+                        if elapsed_min >= 30:
+                            await notify_unattended_client_event(
+                                phone=conv.phone,
+                                nombre=state.get("nombre", "Clienta"),
+                                wait_minutes=elapsed_min,
+                                tenant_id=conv.tenant_id or "glowlab",
+                            )
+                            state["unattended_alert_sent"] = True
+                            conv.estado = dict(state)
+                            await db.commit()
+        except Exception as e:
+            logger.error(f"Error en run_unattended_atencion_personalizada_scan: {e}")
 
 
 async def send_daily_evening_summary(tenant_id: str = "glowlab") -> str:
-    """Envía el resumen de fin de día (8:00 PM) con la agenda completa de mañana."""
-    report = await get_staff_citas_report(staff_name="Equipo", timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
-    msg = f"🌙 *Resumen de Cierre de Jornada (8:00 PM)*\n\nAquí tienes la agenda completa programada para mañana:\n\n{report}"
-    await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
-    return msg
+    """Envía el resumen de fin de día (8:00 PM) con la agenda completa de mañana (solo si hay novedades)."""
+    async with scheduled_job_distributed_lock("glowlab_evening_summary") as acquired:
+        if not acquired:
+            return ""
+
+        report, has_citas = await get_staff_citas_report(staff_name="Equipo", timeframe="mañana", all_advisors=True, tenant_id=tenant_id)
+        if not has_citas:
+            logger.info(f"🌙 [RESUMEN NOCHE] Omitido envío de resumen de 8:00 PM a staff ({tenant_id}) por falta de novedades (0 citas para mañana).")
+            return report
+
+        msg = f"🌙 *Resumen de Cierre de Jornada (8:00 PM)*\n\nAquí tienes la agenda completa programada para mañana:\n\n{report}"
+        await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+        return msg
 
 
 async def send_daily_morning_summary(tenant_id: str = "glowlab") -> str:
     """Envía el resumen de inicio de día (8:00 AM) con la agenda de hoy y vacía las notificaciones nocturnas."""
-    flushed = await flush_pending_staff_notifications(tenant_id=tenant_id)
-    logger.info(f"🌅 Vaciadas {flushed} notificaciones nocturnas para tenant '{tenant_id}'")
+    async with scheduled_job_distributed_lock("glowlab_morning_summary") as acquired:
+        if not acquired:
+            return ""
 
-    report = await get_staff_citas_report(staff_name="Equipo", timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
-    msg = f"☀️ *Resumen de Inicio de Jornada (8:00 AM)*\n\n¡Buenos días equipo! Esta es la agenda de citas para hoy:\n\n{report}"
-    await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
-    return msg
+        flushed = await flush_pending_staff_notifications(tenant_id=tenant_id)
+        logger.info(f"🌅 Vaciadas {flushed} notificaciones nocturnas para tenant '{tenant_id}'")
+
+        report, has_citas = await get_staff_citas_report(staff_name="Equipo", timeframe="hoy", all_advisors=True, tenant_id=tenant_id)
+        if not has_citas and flushed == 0:
+            logger.info(f"🌅 [RESUMEN MAÑANA] Omitido envío de resumen de 8:00 AM a staff ({tenant_id}) por falta de novedades (0 citas para hoy y 0 notificaciones nocturnas).")
+            return report
+
+        msg = f"☀️ *Resumen de Inicio de Jornada (8:00 AM)*\n\n¡Buenos días equipo! Esta es la agenda de citas para hoy:\n\n{report}"
+        await send_staff_notification(msg, urgent=False, tenant_id=tenant_id)
+        return msg
 
 
 async def send_weekly_summary(tenant_id: str = "glowlab") -> str:
