@@ -365,14 +365,14 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
             sender_number = svc.normalize_phone(raw_sender)
             sender_name = item.get("pushName", "") or ""
 
-            # Detección de Self-Chat vs Outgoing a Cliente:
-            # Si sender_number está en staff_dict -> Es la trabajadora (self-chat o comando directo)
-            # Si fromMe es True y sender_number NO está en staff_dict -> Es un mensaje saliente a una clienta (ignorar)
+            # Detección de Self-Chat vs Outgoing del Bot:
+            # 1. Si fromMe es True y sender_number no está en staff -> Es un mensaje enviado por el bot a una clienta (ignorar)
+            # 2. Si fromMe es True y sender_number SÍ está en staff -> Verificar si fue emitido por el propio bot (registrado en Redis)
+            #    Si fue generado por el bot -> Omitir eco para romper bucle infinito de self-chat.
+            #    Si NO fue generado por el bot -> Es un comando escrito manualmente por la trabajadora en su self-chat (procesar).
             is_from_me = key.get("fromMe", False)
+            msg_id = key.get("id", "")
             is_staff_sender = sender_number in staff_dict
-
-            if is_from_me and not is_staff_sender:
-                continue
 
             message_data: Dict[str, Any] = item.get("message", {}) or {}
 
@@ -386,6 +386,13 @@ async def process_webhook_payload(payload: Dict[str, Any]) -> None:
                 message_text = str(message_data["imageMessage"].get("caption", ""))
             elif isinstance(message_data.get("videoMessage"), dict):
                 message_text = str(message_data["videoMessage"].get("caption", ""))
+
+            if is_from_me:
+                if not is_staff_sender:
+                    continue
+                if await svc.is_bot_outgoing_message(msg_id, sender_number, message_text):
+                    logger.info(f"🔄 [WEBHOOK ECO] Omitiendo eco de mensaje saliente enviado por el bot ({sender_number}, id={msg_id})")
+                    continue
 
             # Solo procesamos si hay texto o imagen
             has_image = "imageMessage" in message_data

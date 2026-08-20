@@ -10,6 +10,7 @@ Incluye:
 - Cliente de Evolution API para enviar mensajes
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -1959,7 +1960,7 @@ async def execute_tool_call(
 
         return {
             "status": "success",
-            "reservation_id": cita.id,
+            "reservation_id": cita_id,
             "service": service,
             "date": date_str,
             "date_formatted": format_fecha_es(target_date),
@@ -2439,6 +2440,83 @@ async def typing_indicator(phone: str, refresh_interval: float = 8.0, tenant_id:
             await send_presence(phone_norm, presence="paused")
 
 
+def _compute_text_hash(text: str) -> str:
+    """Calcula un hash MD5 corto del contenido de texto para deduplicación de eco."""
+    if not text:
+        return ""
+    clean = " ".join(text.strip().split())
+    return hashlib.md5(clean.encode("utf-8")).hexdigest()
+
+
+async def register_sent_bot_message(
+    phone: str, text: str, msg_id: Optional[str] = None, ttl: int = 600
+) -> None:
+    """
+    Registra un mensaje enviado por el bot en Redis para evitar que el webhook de eco
+    procese la salida del bot como un comando entrante (Self-Chat Loop Fix).
+    """
+    try:
+        r = await _get_redis()
+        if not r:
+            return
+        phone_norm = normalize_phone(phone) if phone else ""
+        if msg_id:
+            k1 = f"glowlab:sent_bot_msg:{msg_id}"
+            await r.set(k1, "1", ex=ttl)
+
+        text_hash = _compute_text_hash(text)
+        if phone_norm and text_hash:
+            k2 = f"glowlab:sent_bot_msg_hash:{phone_norm}:{text_hash}"
+            await r.set(k2, "1", ex=ttl)
+    except Exception as e:
+        logger.debug(f"Error registrando mensaje saliente en Redis: {e}")
+
+
+async def is_bot_outgoing_message(
+    msg_id: str, phone: str = "", text: str = ""
+) -> bool:
+    """
+    Verifica si un webhook entrante corresponde a un mensaje enviado por el propio bot.
+    """
+    try:
+        r = await _get_redis()
+        if not r:
+            return False
+
+        if msg_id:
+            k1 = f"glowlab:sent_bot_msg:{msg_id}"
+            if await r.exists(k1):
+                return True
+
+        phone_norm = normalize_phone(phone) if phone else ""
+        text_hash = _compute_text_hash(text)
+        if phone_norm and text_hash:
+            k2 = f"glowlab:sent_bot_msg_hash:{phone_norm}:{text_hash}"
+            if await r.exists(k2):
+                return True
+    except Exception as e:
+        logger.debug(f"Error verificando mensaje saliente en Redis: {e}")
+    return False
+
+
+async def acquire_event_dedupe_lock(dedupe_key: str, ttl: int = 120) -> bool:
+    """
+    Intenta adquirir un lock/flag de deduplicación de eventos en Redis por `ttl` segundos.
+    Retorna True si el evento es NUEVO (se adquirió el lock).
+    Retorna False si el evento ya fue procesado recientemente (duplicado).
+    """
+    try:
+        r = await _get_redis()
+        if not r:
+            return True
+        key = f"glowlab:event_dedupe:{dedupe_key}"
+        acquired = await r.set(key, "1", nx=True, ex=ttl)
+        return bool(acquired)
+    except Exception as e:
+        logger.debug(f"Error comprobando dedupe de evento en Redis: {e}")
+        return True
+
+
 async def send_message(number: str, text: str, tenant_id: str = "glowlab") -> bool:
     """Envía un mensaje de texto a través de Evolution API usando la instancia del tenant correspondiente."""
     profile = await get_tenant_profile(tenant_id)
@@ -2454,7 +2532,21 @@ async def send_message(number: str, text: str, tenant_id: str = "glowlab") -> bo
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             res = await client.post(url, headers=headers, json={"number": number, "text": text})
-            return res.status_code in (200, 201)
+            if res.status_code in (200, 201):
+                msg_id = None
+                try:
+                    data = res.json()
+                    if isinstance(data, dict):
+                        key_obj = data.get("key", {})
+                        if isinstance(key_obj, dict):
+                            msg_id = key_obj.get("id")
+                        if not msg_id:
+                            msg_id = data.get("id")
+                except Exception:
+                    pass
+                await register_sent_bot_message(number, text, msg_id=msg_id)
+                return True
+            return False
     except Exception as e:
         logger.error(f"Error enviando mensaje a {number} [{tenant_id}]: {e}")
         return False
@@ -2578,6 +2670,11 @@ async def notify_cita_confirmed_event(
     tenant_id: str = "glowlab",
 ) -> None:
     """Evento 1: Cita confirmada/agendada (por cliente o staff)."""
+    dedupe_key = f"cita_confirmed:{tenant_id}:{cita_id or cliente_phone}"
+    if not await acquire_event_dedupe_lock(dedupe_key, ttl=120):
+        logger.info(f"⏭️ Omitiendo evento de cita confirmada duplicado para Cita #{cita_id} ({cliente_phone})")
+        return
+
     f_dt = parse_fecha(fecha) if fecha else None
     f_str = format_fecha_es(f_dt) if f_dt else fecha
     h_str = format_hora_12h(hora) if hora else hora
@@ -2602,6 +2699,12 @@ async def notify_atencion_personalizada_event(
     tenant_id: str = "glowlab",
 ) -> None:
     """Evento 2: Clienta selecciona opción 2 (atención personalizada)."""
+    phone_norm = normalize_phone(phone)
+    dedupe_key = f"atencion_personalizada:{tenant_id}:{phone_norm}"
+    if not await acquire_event_dedupe_lock(dedupe_key, ttl=120):
+        logger.info(f"⏭️ Omitiendo evento de atención personalizada duplicado para +{phone_norm}")
+        return
+
     text = (
         f"🔔 *Solicitud de Atención Personalizada (Opción 2)*\n\n"
         f"👤 Clienta: {nombre or 'Sin nombre'} (📱 +{phone})\n"
@@ -2621,6 +2724,11 @@ async def notify_cita_cancelled_event(
     tenant_id: str = "glowlab",
 ) -> None:
     """Evento 3 y 8: Cancelación de cita por la clienta y horario liberado."""
+    dedupe_key = f"cita_cancelled:{tenant_id}:{cita_id or cliente_phone}"
+    if not await acquire_event_dedupe_lock(dedupe_key, ttl=120):
+        logger.info(f"⏭️ Omitiendo evento de cita cancelada duplicado para Cita #{cita_id}")
+        return
+
     f_dt = parse_fecha(fecha) if fecha else None
     f_str = format_fecha_es(f_dt) if f_dt else fecha
     h_str = format_hora_12h(hora) if hora else hora
@@ -2642,6 +2750,12 @@ async def notify_voucher_unclear_event(
     tenant_id: str = "glowlab",
 ) -> None:
     """Evento 4: Comprobante que el OCR no pudo validar con certeza."""
+    phone_norm = normalize_phone(phone)
+    dedupe_key = f"voucher_unclear:{tenant_id}:{phone_norm}"
+    if not await acquire_event_dedupe_lock(dedupe_key, ttl=120):
+        logger.info(f"⏭️ Omitiendo evento de comprobante dudoso duplicado para +{phone_norm}")
+        return
+
     text = (
         f"📸 *Comprobante Requiere Revisión Manual*\n\n"
         f"👤 Clienta: {nombre or 'Sin nombre'} (📱 +{phone})\n"

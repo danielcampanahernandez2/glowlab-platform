@@ -104,7 +104,7 @@ def fake_redis_fixture():
     return FakeRedis()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def setup_environment(fake_redis):
     svc._in_memory_state.clear()
     svc._in_memory_phone_locks.clear()
@@ -114,12 +114,14 @@ def setup_environment(fake_redis):
         patch("app.modules.salon.services.async_session_factory", side_effect=DummyDBSession),
         patch("app.api.v1.endpoints.whatsapp.async_session_factory", side_effect=DummyDBSession),
         patch("app.modules.salon.services.send_presence", new=AsyncMock(return_value=True)),
-        patch("app.modules.salon.services.send_message", new=AsyncMock(return_value=True)),
         patch("app.modules.salon.services.is_within_staff_silence_window", return_value=True),
     ):
         yield fake_redis
         svc._in_memory_state.clear()
         svc._in_memory_phone_locks.clear()
+
+
+pytestmark = pytest.mark.usefixtures("setup_environment")
 
 
 # ============================================================
@@ -153,7 +155,7 @@ async def test_self_chat_message_routes_to_staff_and_never_triggers_client_menu(
     }
 
     with (
-        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_replies.append(msg))),
+        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda num, msg, **kw: sent_replies.append(msg))),
         patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=("📋 Agenda de Citas: 0 citas hoy", False))),
     ):
         await process_webhook_payload(payload)
@@ -194,7 +196,7 @@ async def test_instance_number_self_chat_routes_to_staff():
     }
 
     with (
-        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda _, msg: sent_replies.append(msg))),
+        patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda num, msg, **kw: sent_replies.append(msg))),
         patch("app.modules.salon.services.get_staff_citas_report", new=AsyncMock(return_value=("📋 Agenda de Citas: 0 citas mañana", False))),
     ):
         await process_webhook_payload(payload)
@@ -218,7 +220,7 @@ async def test_staff_activar_bot_by_phone():
     staff_phone = "51992509246"
     sent_messages = []
 
-    with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda to, msg: sent_messages.append((to, msg)))):
+    with patch("app.modules.salon.services.send_message", new=AsyncMock(side_effect=lambda to, msg, **kw: sent_messages.append((to, msg)))):
         reply = await svc.execute_staff_command(
             staff_phone=staff_phone,
             staff_name="Lizbeth",
